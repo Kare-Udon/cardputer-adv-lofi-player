@@ -1,0 +1,44 @@
+{
+  "icons": [
+    {
+      "name": "Note",
+      "source": "footer_icons.pbm",
+      "crop": [0, 0, 16, 12],
+      "x": 10,
+      "y": 121,
+      "mode": "dark",
+      "threshold": 127,
+      "trim": false
+    },
+    {
+      "name": "Speaker",
+      "source": "footer_icons.pbm",
+      "crop": [24, 0, 16, 12],
+      "x": 113,
+      "y": 121,
+      "mode": "dark",
+      "threshold": 127,
+      "trim": false
+    },
+    {
+      "name": "Repeat",
+      "source": "footer_icons.pbm",
+      "crop": [48, 0, 16, 12],
+      "x": 146,
+      "y": 121,
+      "mode": "dark",
+      "threshold": 127,
+      "trim": false
+    },
+    {
+      "name": "Queue",
+      "source": "footer_icons.pbm",
+      "crop": [72, 0, 16, 12],
+      "x": 218,
+      "y": 121,
+      "mode": "dark",
+      "threshold": 127,
+      "trim": false
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+.DS_Store
+*/.DS_Store
+
+# ESP-IDF and host build outputs
+build/
+build-*/
+managed_components/
+
+# Local planning, documentation, debug, and verification materials
+README.md
+docs/
+lofi_cardputer_plan/
+scripts/
+tests/
+tools/
+
+# Python/cache artifacts from local tooling
+__pycache__/
+*.py[cod]
+
+# Local logs and temporary files
+*.log
+*.tmp

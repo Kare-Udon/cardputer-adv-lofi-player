@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "lofi_audio.cpp"
+        "lofi_board.cpp"
+        "../src/lofi_core.cpp"
+        "../src/lofi_dsp.cpp"
+        "../src/lofi_storage.cpp"
+        "../src/lofi_wav.cpp"
+    INCLUDE_DIRS
+        "."
+        "../src"
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_spi
+        esp_lcd
+        esp_timer
+        espressif__esp_audio_codec
+        fatfs
+        lvgl
+        nvs_flash
+        sdmmc
+)
