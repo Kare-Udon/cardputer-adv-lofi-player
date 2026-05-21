@@ -15,6 +15,7 @@ tests/
 tools/
 
 # Python/cache artifacts from local tooling
+.cache/
 __pycache__/
 *.py[cod]
 

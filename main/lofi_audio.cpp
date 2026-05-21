@@ -31,7 +31,7 @@ namespace lofi_audio {
 namespace {
 
 const char *TAG = "lofi_audio";
-constexpr uint32_t kAudioTaskStackBytes = 32768;
+constexpr uint32_t kAudioTaskStackBytes = 16384;
 constexpr UBaseType_t kAudioTaskPriority = 8;
 constexpr size_t kSimpleDecoderInputBytes = 8 * 1024;
 constexpr size_t kSimpleDecoderOutputBytes = 8 * 1024;

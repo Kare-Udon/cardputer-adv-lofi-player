@@ -1,6 +1,23 @@
 idf_component_register(
     SRCS
         "app_main.cpp"
+        "lofi_font_fusion_pixel_8.c"
+        "lofi_font_fusion_pixel_10.c"
+        "lofi_font_fusion_pixel_12.c"
+        "lofi_font_fusion_pixel_14.c"
+        "lofi_font_fusion_pixel_ui_12.c"
+        "lofi_font_fusion_pixel_ui_16.c"
+        "lofi_font_fusion_pixel_ui_20.c"
+        "generated_icons/library_center_rgb565.c"
+        "generated_icons/library_side_rgb565.c"
+        "generated_icons/lofi_center_rgb565.c"
+        "generated_icons/lofi_side_rgb565.c"
+        "generated_icons/now_center_rgb565.c"
+        "generated_icons/now_side_rgb565.c"
+        "generated_icons/queue_center_rgb565.c"
+        "generated_icons/queue_side_rgb565.c"
+        "generated_icons/settings_center_rgb565.c"
+        "generated_icons/settings_side_rgb565.c"
         "lofi_audio.cpp"
         "lofi_board.cpp"
         "../src/lofi_core.cpp"
@@ -15,6 +32,7 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_i2s
         esp_driver_spi
+        esp_driver_usb_serial_jtag
         esp_lcd
         esp_timer
         espressif__esp_audio_codec

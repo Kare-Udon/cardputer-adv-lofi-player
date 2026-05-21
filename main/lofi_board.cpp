@@ -1,7 +1,6 @@
 #include "lofi_board.hpp"
 
 #include "board_pins.h"
-#include "lofi_cjk_font.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -24,7 +23,26 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "driver/ledc.h"
 #include "lvgl.h"
+
+extern "C" const lv_font_t lofi_font_fusion_pixel_10;
+extern "C" const lv_font_t lofi_font_fusion_pixel_12;
+extern "C" const lv_font_t lofi_font_fusion_pixel_14;
+extern "C" const lv_font_t lofi_font_fusion_pixel_8;
+extern "C" const lv_font_t lofi_font_fusion_pixel_ui_12;
+extern "C" const lv_font_t lofi_font_fusion_pixel_ui_16;
+extern "C" const lv_font_t lofi_font_fusion_pixel_ui_20;
+extern "C" const lv_image_dsc_t library_center_rgb565;
+extern "C" const lv_image_dsc_t library_side_rgb565;
+extern "C" const lv_image_dsc_t lofi_center_rgb565;
+extern "C" const lv_image_dsc_t lofi_side_rgb565;
+extern "C" const lv_image_dsc_t now_center_rgb565;
+extern "C" const lv_image_dsc_t now_side_rgb565;
+extern "C" const lv_image_dsc_t queue_center_rgb565;
+extern "C" const lv_image_dsc_t queue_side_rgb565;
+extern "C" const lv_image_dsc_t settings_center_rgb565;
+extern "C" const lv_image_dsc_t settings_side_rgb565;
 
 namespace lofi_board {
 namespace {
@@ -39,17 +57,48 @@ bool s_keyboard_ready = false;
 bool s_fn_down = false;
 char s_last_key_name[12] = "-";
 KeyboardDiagnostics s_keyboard_diag;
+bool s_hold_active = false;
+lofi::Action s_hold_action = lofi::Action::None;
+char s_hold_key_name[12] = "-";
+TickType_t s_hold_started_tick = 0;
+TickType_t s_hold_last_emit_tick = 0;
+uint16_t s_hold_repeat_count = 0;
 uint16_t s_shadow_framebuffer[LCD_WIDTH * LCD_HEIGHT] = {};
 bool s_shadow_framebuffer_valid = false;
 uint32_t s_framebuffer_dump_seq = 0;
 lv_display_t *s_lvgl_display = nullptr;
 esp_timer_handle_t s_lvgl_tick_timer = nullptr;
-alignas(4) uint16_t s_lvgl_draw_buffer[LCD_WIDTH * 24] = {};
+alignas(4) uint16_t s_lvgl_draw_buffer[LCD_WIDTH * 36] = {};
 volatile bool s_lvgl_flush_pending = false;
-lv_font_t s_lvgl_title_font;
-lv_font_t s_lvgl_normal_font;
-lv_font_t s_lvgl_small_font;
-bool s_lvgl_font_fallbacks_ready = false;
+bool s_screen_awake = true;
+int s_screen_brightness_percent = 100;
+bool s_backlight_pwm_ready = false;
+
+constexpr ledc_mode_t kBacklightLedcMode = LEDC_LOW_SPEED_MODE;
+constexpr ledc_timer_t kBacklightLedcTimer = LEDC_TIMER_0;
+constexpr ledc_channel_t kBacklightLedcChannel = LEDC_CHANNEL_0;
+constexpr ledc_timer_bit_t kBacklightLedcResolution = LEDC_TIMER_10_BIT;
+constexpr uint32_t kBacklightLedcMaxDuty = (1U << 10) - 1U;
+
+struct MarqueeState {
+    std::string text;
+    uint32_t started_ms = 0;
+};
+
+struct MarqueeTiming {
+    uint32_t lead_hold_ms = 2200;
+    uint32_t tail_hold_ms = 1600;
+    uint32_t start_delay_ms = 0;
+    uint16_t speed_px_per_sec = 18;
+    uint16_t cell_step_ms = 780;
+};
+
+MarqueeState s_title_marquee;
+MarqueeState s_artist_marquee;
+MarqueeState s_queue_marquee;
+MarqueeState s_library_marquee;
+int s_home_last_selected = -1;
+std::string s_last_panel_page_title;
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -60,6 +109,48 @@ uint16_t lcd_color565(uint8_t r, uint8_t g, uint8_t b)
 {
     uint16_t color = rgb565(r, g, b);
     return (uint16_t)((color << 8) | (color >> 8));
+}
+
+int normalize_backlight_percent(int percent)
+{
+    return std::max(10, std::min(100, ((percent + 5) / 10) * 10));
+}
+
+uint32_t backlight_duty_for_percent(int percent)
+{
+    percent = normalize_backlight_percent(percent);
+    if (percent >= 100) {
+        return kBacklightLedcMaxDuty;
+    }
+
+    // The Cardputer Adv BL enable path is only useful near full duty:
+    // physical testing showed 90% duty is already about half brightness and
+    // 80% duty can effectively turn the backlight off.
+    constexpr uint32_t kUsableMinDutyPercent = 92;
+    constexpr uint32_t kUsableSpanPercent = 100 - kUsableMinDutyPercent;
+    const uint32_t duty_percent =
+        kUsableMinDutyPercent +
+        (static_cast<uint32_t>(percent - 10) * kUsableSpanPercent + 45U) / 90U;
+    return kBacklightLedcMaxDuty * duty_percent / 100U;
+}
+
+uint32_t backlight_duty_for_state(void)
+{
+    if (!s_screen_awake) {
+        return 0;
+    }
+    return backlight_duty_for_percent(s_screen_brightness_percent);
+}
+
+void apply_backlight(void)
+{
+    const uint32_t duty = backlight_duty_for_state();
+    if (s_backlight_pwm_ready) {
+        ledc_set_duty(kBacklightLedcMode, kBacklightLedcChannel, duty);
+        ledc_update_duty(kBacklightLedcMode, kBacklightLedcChannel);
+    } else {
+        gpio_set_level(static_cast<gpio_num_t>(PIN_LCD_BL), duty > 0 ? 1 : 0);
+    }
 }
 
 esp_err_t lcd_draw_solid(uint16_t color)
@@ -77,6 +168,26 @@ esp_err_t lcd_draw_solid(uint16_t color)
         std::fill_n(&s_shadow_framebuffer[y * LCD_WIDTH], LCD_WIDTH, color);
     }
     s_shadow_framebuffer_valid = true;
+    return ESP_OK;
+}
+
+void wait_for_lvgl_flush_idle(uint32_t timeout_ms = 30)
+{
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    while (s_lvgl_flush_pending && esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+esp_err_t preclear_panel_on_page_change(const std::string &title, uint16_t bg)
+{
+    if (s_last_panel_page_title == title) {
+        return ESP_OK;
+    }
+    wait_for_lvgl_flush_idle();
+    ESP_RETURN_ON_ERROR(lcd_draw_solid(bg), TAG, "page preclear");
+    wait_for_lvgl_flush_idle();
+    s_last_panel_page_title = title;
     return ESP_OK;
 }
 
@@ -100,31 +211,6 @@ void unlock_i2c(void)
     }
 }
 
-esp_err_t lcd_fill_rect(int x0, int y0, int x1, int y1, uint16_t color)
-{
-    if (!s_lcd_panel) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    x0 = std::max(0, std::min(LCD_WIDTH, x0));
-    x1 = std::max(0, std::min(LCD_WIDTH, x1));
-    y0 = std::max(0, std::min(LCD_HEIGHT, y0));
-    y1 = std::max(0, std::min(LCD_HEIGHT, y1));
-    if (x0 >= x1 || y0 >= y1) {
-        return ESP_OK;
-    }
-
-    uint16_t line[LCD_WIDTH];
-    for (int x = x0; x < x1; ++x) {
-        line[x - x0] = color;
-    }
-    for (int y = y0; y < y1; ++y) {
-        ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(s_lcd_panel, x0, y, x1, y + 1, line), TAG, "fill rect");
-        std::fill_n(&s_shadow_framebuffer[y * LCD_WIDTH + x0], x1 - x0, color);
-    }
-    s_shadow_framebuffer_valid = true;
-    return ESP_OK;
-}
-
 uint32_t framebuffer_hash(void)
 {
     uint32_t hash = 2166136261u;
@@ -138,357 +224,6 @@ uint32_t framebuffer_hash(void)
     return hash;
 }
 
-uint8_t glyph3x5_row(char ch, int row)
-{
-    switch (ch) {
-    case '0': {
-        static const uint8_t r[5] = {7, 5, 5, 5, 7};
-        return r[row];
-    }
-    case '1': {
-        static const uint8_t r[5] = {2, 6, 2, 2, 7};
-        return r[row];
-    }
-    case '2': {
-        static const uint8_t r[5] = {7, 1, 7, 4, 7};
-        return r[row];
-    }
-    case '3': {
-        static const uint8_t r[5] = {7, 1, 7, 1, 7};
-        return r[row];
-    }
-    case '4': {
-        static const uint8_t r[5] = {5, 5, 7, 1, 1};
-        return r[row];
-    }
-    case '5': {
-        static const uint8_t r[5] = {7, 4, 7, 1, 7};
-        return r[row];
-    }
-    case '6': {
-        static const uint8_t r[5] = {7, 4, 7, 5, 7};
-        return r[row];
-    }
-    case '7': {
-        static const uint8_t r[5] = {7, 1, 1, 2, 2};
-        return r[row];
-    }
-    case '8': {
-        static const uint8_t r[5] = {7, 5, 7, 5, 7};
-        return r[row];
-    }
-    case '9': {
-        static const uint8_t r[5] = {7, 5, 7, 1, 7};
-        return r[row];
-    }
-    case 'A': {
-        static const uint8_t r[5] = {2, 5, 7, 5, 5};
-        return r[row];
-    }
-    case 'B': {
-        static const uint8_t r[5] = {6, 5, 6, 5, 6};
-        return r[row];
-    }
-    case 'C': {
-        static const uint8_t r[5] = {7, 4, 4, 4, 7};
-        return r[row];
-    }
-    case 'D': {
-        static const uint8_t r[5] = {6, 5, 5, 5, 6};
-        return r[row];
-    }
-    case 'E': {
-        static const uint8_t r[5] = {7, 4, 6, 4, 7};
-        return r[row];
-    }
-    case 'F': {
-        static const uint8_t r[5] = {7, 4, 6, 4, 4};
-        return r[row];
-    }
-    case 'G': {
-        static const uint8_t r[5] = {7, 4, 5, 5, 7};
-        return r[row];
-    }
-    case 'H': {
-        static const uint8_t r[5] = {5, 5, 7, 5, 5};
-        return r[row];
-    }
-    case 'I': {
-        static const uint8_t r[5] = {7, 2, 2, 2, 7};
-        return r[row];
-    }
-    case 'J': {
-        static const uint8_t r[5] = {1, 1, 1, 5, 7};
-        return r[row];
-    }
-    case 'K': {
-        static const uint8_t r[5] = {5, 5, 6, 5, 5};
-        return r[row];
-    }
-    case 'L': {
-        static const uint8_t r[5] = {4, 4, 4, 4, 7};
-        return r[row];
-    }
-    case 'M': {
-        static const uint8_t r[5] = {5, 7, 7, 5, 5};
-        return r[row];
-    }
-    case 'N': {
-        static const uint8_t r[5] = {5, 7, 7, 7, 5};
-        return r[row];
-    }
-    case 'O': {
-        static const uint8_t r[5] = {7, 5, 5, 5, 7};
-        return r[row];
-    }
-    case 'P': {
-        static const uint8_t r[5] = {7, 5, 7, 4, 4};
-        return r[row];
-    }
-    case 'Q': {
-        static const uint8_t r[5] = {7, 5, 5, 7, 1};
-        return r[row];
-    }
-    case 'R': {
-        static const uint8_t r[5] = {6, 5, 6, 5, 5};
-        return r[row];
-    }
-    case 'S': {
-        static const uint8_t r[5] = {7, 4, 7, 1, 7};
-        return r[row];
-    }
-    case 'T': {
-        static const uint8_t r[5] = {7, 2, 2, 2, 2};
-        return r[row];
-    }
-    case 'U': {
-        static const uint8_t r[5] = {5, 5, 5, 5, 7};
-        return r[row];
-    }
-    case 'V': {
-        static const uint8_t r[5] = {5, 5, 5, 5, 2};
-        return r[row];
-    }
-    case 'W': {
-        static const uint8_t r[5] = {5, 5, 7, 7, 5};
-        return r[row];
-    }
-    case 'X': {
-        static const uint8_t r[5] = {5, 5, 2, 5, 5};
-        return r[row];
-    }
-    case 'Y': {
-        static const uint8_t r[5] = {5, 5, 2, 2, 2};
-        return r[row];
-    }
-    case 'Z': {
-        static const uint8_t r[5] = {7, 1, 2, 4, 7};
-        return r[row];
-    }
-    case ':': {
-        static const uint8_t r[5] = {0, 2, 0, 2, 0};
-        return r[row];
-    }
-    case '-': {
-        static const uint8_t r[5] = {0, 0, 7, 0, 0};
-        return r[row];
-    }
-    case '_': {
-        static const uint8_t r[5] = {0, 0, 0, 0, 7};
-        return r[row];
-    }
-    case '~': {
-        static const uint8_t r[5] = {0, 0, 3, 6, 0};
-        return r[row];
-    }
-    case '/': {
-        static const uint8_t r[5] = {1, 1, 2, 4, 4};
-        return r[row];
-    }
-    case '%': {
-        static const uint8_t r[5] = {5, 1, 2, 4, 5};
-        return r[row];
-    }
-    case '.': {
-        static const uint8_t r[5] = {0, 0, 0, 0, 2};
-        return r[row];
-    }
-    case '(': {
-        static const uint8_t r[5] = {1, 2, 2, 2, 1};
-        return r[row];
-    }
-    case ')': {
-        static const uint8_t r[5] = {4, 2, 2, 2, 4};
-        return r[row];
-    }
-    case '*': {
-        static const uint8_t r[5] = {0, 5, 2, 5, 0};
-        return r[row];
-    }
-    case '>': {
-        static const uint8_t r[5] = {4, 2, 1, 2, 4};
-        return r[row];
-    }
-    case '?': {
-        static const uint8_t r[5] = {7, 1, 3, 0, 2};
-        return r[row];
-    }
-    default:
-        return 0;
-    }
-}
-
-const cjk_font::Glyph *find_cjk_glyph(uint32_t codepoint)
-{
-    for (size_t i = 0; i < cjk_font::kGlyphCount; ++i) {
-        if (cjk_font::kGlyphs[i].codepoint == codepoint) {
-            return &cjk_font::kGlyphs[i];
-        }
-    }
-    return nullptr;
-}
-
-const cjk_font::TinyGlyph *find_tiny_cjk_glyph(uint32_t codepoint)
-{
-    for (size_t i = 0; i < cjk_font::kTinyGlyphCount; ++i) {
-        if (cjk_font::kTinyGlyphs[i].codepoint == codepoint) {
-            return &cjk_font::kTinyGlyphs[i];
-        }
-    }
-    return nullptr;
-}
-
-bool decode_utf8(const std::string &text, size_t &offset, uint32_t &codepoint)
-{
-    if (offset >= text.size()) {
-        return false;
-    }
-    const unsigned char c0 = static_cast<unsigned char>(text[offset]);
-    if (c0 < 0x80) {
-        codepoint = c0;
-        ++offset;
-        return true;
-    }
-    if ((c0 & 0xE0) == 0xC0 && offset + 1 < text.size()) {
-        const unsigned char c1 = static_cast<unsigned char>(text[offset + 1]);
-        if ((c1 & 0xC0) == 0x80) {
-            codepoint = ((c0 & 0x1F) << 6) | (c1 & 0x3F);
-            offset += 2;
-            return true;
-        }
-    } else if ((c0 & 0xF0) == 0xE0 && offset + 2 < text.size()) {
-        const unsigned char c1 = static_cast<unsigned char>(text[offset + 1]);
-        const unsigned char c2 = static_cast<unsigned char>(text[offset + 2]);
-        if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
-            codepoint = ((c0 & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F);
-            offset += 3;
-            return true;
-        }
-    }
-    codepoint = '?';
-    ++offset;
-    return true;
-}
-
-int text_cell_width(uint32_t codepoint)
-{
-    if (codepoint < 0x80) {
-        return 1;
-    }
-    return find_cjk_glyph(codepoint) ? 2 : 1;
-}
-
-void draw_ascii_char(int x, int y, char ch, int scale, uint16_t color)
-{
-    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    for (int row = 0; row < 5; ++row) {
-        const uint8_t bits = glyph3x5_row(ch, row);
-        for (int col = 0; col < 3; ++col) {
-            if (bits & (1 << (2 - col))) {
-                const int px = x + col * scale;
-                const int py = y + row * scale;
-                lcd_fill_rect(px, py, px + scale, py + scale, color);
-            }
-        }
-    }
-}
-
-int draw_cjk_char(int x, int y, const cjk_font::Glyph &glyph, int scale, uint16_t color)
-{
-    scale = std::max(1, scale);
-    for (int row = 0; row < cjk_font::kGlyphHeight; ++row) {
-        const uint16_t bits = glyph.rows[row];
-        for (int col = 0; col < glyph.width && col < 12; ++col) {
-            if (bits & (1 << (11 - col))) {
-                const int px = x + col * scale;
-                const int py = y + row * scale;
-                lcd_fill_rect(px, py, px + scale, py + scale, color);
-            }
-        }
-    }
-    return (glyph.width + 1) * scale;
-}
-
-int draw_tiny_cjk_char(int x, int y, const cjk_font::TinyGlyph &glyph, uint16_t color)
-{
-    for (int row = 0; row < cjk_font::kTinyGlyphHeight; ++row) {
-        const uint16_t bits = glyph.rows[row];
-        for (int col = 0; col < glyph.width && col < 8; ++col) {
-            if (bits & (1 << (7 - col))) {
-                lcd_fill_rect(x + col, y + row, x + col + 1, y + row + 1, color);
-            }
-        }
-    }
-    return glyph.width + 1;
-}
-
-void draw_text(int x, int y, const std::string &text, int scale, uint16_t color)
-{
-    if (scale <= 0) {
-        return;
-    }
-    size_t offset = 0;
-    int cursor = x;
-    size_t drawn = 0;
-    while (offset < text.size() && drawn < 40) {
-        uint32_t codepoint = 0;
-        if (!decode_utf8(text, offset, codepoint) || codepoint < 0x20) {
-            continue;
-        }
-        const cjk_font::Glyph *glyph = codepoint >= 0x80 ? find_cjk_glyph(codepoint) : nullptr;
-        if (glyph) {
-            cursor += draw_cjk_char(cursor, y - (scale > 1 ? 1 : 0), *glyph, scale, color);
-        } else {
-            const char ch = codepoint < 0x80 ? static_cast<char>(codepoint) : '?';
-            draw_ascii_char(cursor, y, ch, scale, color);
-            cursor += 4 * scale;
-        }
-        ++drawn;
-    }
-}
-
-void draw_text_tiny(int x, int y, const std::string &text, uint16_t color)
-{
-    size_t offset = 0;
-    int cursor = x;
-    size_t drawn = 0;
-    while (offset < text.size() && drawn < 48) {
-        uint32_t codepoint = 0;
-        if (!decode_utf8(text, offset, codepoint) || codepoint < 0x20) {
-            continue;
-        }
-        const cjk_font::TinyGlyph *glyph = codepoint >= 0x80 ? find_tiny_cjk_glyph(codepoint) : nullptr;
-        if (glyph) {
-            cursor += draw_tiny_cjk_char(cursor, y, *glyph, color);
-        } else {
-            const char ch = codepoint < 0x80 ? static_cast<char>(codepoint) : '?';
-            draw_ascii_char(cursor, y + 1, ch, 1, color);
-            cursor += 4;
-        }
-        ++drawn;
-    }
-}
-
 std::string strip_selection_marker(const std::string &value)
 {
     size_t pos = 0;
@@ -498,162 +233,50 @@ std::string strip_selection_marker(const std::string &value)
     return value.substr(pos);
 }
 
-std::string fit_label(const std::string &value, size_t max_chars)
+uint32_t now_ms(void)
 {
-    size_t offset = 0;
-    size_t cells = 0;
-    size_t last_good = 0;
-    while (offset < value.size()) {
-        uint32_t codepoint = 0;
-        if (!decode_utf8(value, offset, codepoint)) {
-            break;
-        }
-        const size_t width = static_cast<size_t>(text_cell_width(codepoint));
-        if (cells + width > max_chars) {
-            break;
-        }
-        cells += width;
-        last_good = offset;
-    }
-    if (last_good >= value.size()) {
-        return value;
-    }
-    if (max_chars <= 1) {
-        return value.substr(0, last_good);
-    }
-    return value.substr(0, last_good) + "~";
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
 }
 
-std::vector<std::string> utf8_units(const std::string &value)
+void reset_marquee_if_needed(MarqueeState &state, const std::string &text, uint32_t now)
 {
-    std::vector<std::string> units;
-    size_t offset = 0;
-    while (offset < value.size()) {
-        const size_t start = offset;
-        uint32_t codepoint = 0;
-        if (!decode_utf8(value, offset, codepoint) || codepoint < 0x20) {
-            continue;
-        }
-        if (offset <= value.size() && offset > start) {
-            units.push_back(value.substr(start, offset - start));
-        }
+    if (state.text != text) {
+        state.text = text;
+        state.started_ms = now;
     }
-    return units;
 }
 
-std::string marquee_label(const std::string &value, size_t max_cells, size_t phase)
+uint32_t marquee_phase_ms(MarqueeState &state,
+                          const std::string &text,
+                          uint32_t now,
+                          uint32_t scroll_span,
+                          uint32_t speed_per_sec,
+                          const MarqueeTiming &timing)
 {
-    if (max_cells == 0) {
-        return "";
-    }
-    const std::string fitted = fit_label(value, max_cells);
-    if (fitted == value) {
-        return value;
-    }
-
-    std::vector<std::string> units = utf8_units(value);
-    if (units.empty()) {
-        return "";
-    }
-    units.push_back(" ");
-    units.push_back(" ");
-    units.push_back(" ");
-
-    const size_t start = phase % units.size();
-    std::string out;
-    size_t cells = 0;
-    for (size_t step = 0; step < units.size() && cells < max_cells; ++step) {
-        const std::string &unit = units[(start + step) % units.size()];
-        size_t unit_offset = 0;
-        uint32_t codepoint = 0;
-        if (!decode_utf8(unit, unit_offset, codepoint)) {
-            codepoint = '?';
-        }
-        const size_t width = static_cast<size_t>(text_cell_width(codepoint));
-        if (cells + width > max_cells) {
-            break;
-        }
-        out += unit;
-        cells += width;
-    }
-    return out;
+    reset_marquee_if_needed(state, text, now);
+    const uint32_t speed = std::max<uint32_t>(1, speed_per_sec);
+    const uint32_t scroll_ms = std::max<uint32_t>(1, (scroll_span * 1000U + speed - 1U) / speed);
+    const uint32_t cycle_ms = timing.start_delay_ms + timing.lead_hold_ms + scroll_ms + timing.tail_hold_ms;
+    return cycle_ms > 0 ? (now - state.started_ms) % cycle_ms : 0;
 }
 
-std::string localize_title(const std::string &value)
+uint32_t marquee_offset(uint32_t phase_ms,
+                        uint32_t scroll_span,
+                        uint32_t speed_per_sec,
+                        const MarqueeTiming &timing)
 {
-    return value;
-}
-
-std::string localize_soft_key(const std::string &value)
-{
-    return value;
-}
-
-std::string localize_row_left(const std::string &value)
-{
-    return value;
+    const uint32_t scroll_start = timing.start_delay_ms + timing.lead_hold_ms;
+    if (phase_ms < scroll_start) {
+        return 0;
+    }
+    const uint32_t speed = std::max<uint32_t>(1, speed_per_sec);
+    const uint32_t scrolled = (phase_ms - scroll_start) * speed / 1000U;
+    return std::min<uint32_t>(scroll_span, scrolled);
 }
 
 std::string localize_right_label(const std::string &value)
 {
     return value;
-}
-
-std::string row_hint(const std::string &page, const std::string &label, const std::string &right)
-{
-    if (page == "Library") {
-        if (label == "Now Playing") {
-            return "Default entry";
-        }
-        if (label == "Albums") {
-            return "Play by album";
-        }
-        if (label == "Artists") {
-            return "Browse by artist";
-        }
-        if (label == "Shuffle All") {
-            return "Shuffle Music";
-        }
-        if (label == "Folder") {
-            return "Loose files";
-        }
-        if (label == "Lo-Fi") {
-            return "Tape color presets";
-        }
-    }
-    if (page == "Lo-Fi") {
-        if (label == "Off") {
-            return "Clean playback";
-        }
-        if (label == "Warm Tape") {
-            return "Warm tape wobble";
-        }
-        if (label == "Vinyl Cafe") {
-            return "Vinyl noise";
-        }
-        if (label == "Rainy Window") {
-            return "Soft rainy space";
-        }
-        if (label == "Tiny Radio") {
-            return "Narrow radio";
-        }
-        if (label == "Late Night") {
-            return "Low night tone";
-        }
-        if (label == "Custom") {
-            return "Intensity custom";
-        }
-    }
-    if (page == "Folder") {
-        if (!right.empty()) {
-            return fit_label(right, 18);
-        }
-        return "LOOSE MUSIC";
-    }
-    if ((page == "Albums" || page == "Artists" || page == "Queue") && !right.empty()) {
-        return fit_label(right, 18);
-    }
-    return "";
 }
 
 int parse_position_seconds(const lofi::ScreenModel &screen)
@@ -667,15 +290,6 @@ int parse_position_seconds(const lofi::ScreenModel &screen)
     return 0;
 }
 
-int parse_volume_toast(const std::string &status)
-{
-    const std::string marker = "Volume ";
-    if (status.rfind(marker, 0) != 0) {
-        return -1;
-    }
-    return std::max(0, std::min(100, std::atoi(status.c_str() + marker.size())));
-}
-
 std::string format_mmss(int seconds)
 {
     seconds = std::max(0, seconds);
@@ -684,8 +298,11 @@ std::string format_mmss(int seconds)
     return std::string(buf);
 }
 
-std::string lofi_strength_summary(const std::string &status)
+std::string lofi_strength_summary(const std::string &status, const std::string &meta = "")
 {
+    if (meta.rfind("Intensity ", 0) == 0) {
+        return meta;
+    }
     const size_t lf_pos = status.find("LF ");
     if (lf_pos == std::string::npos) {
         return "Intensity --";
@@ -707,231 +324,6 @@ std::string lofi_strength_summary(const std::string &status)
         return "Intensity custom";
     }
     return "Intensity --";
-}
-
-void draw_list_icon(int x, int y, const std::string &page, const std::string &label, size_t row, uint16_t color)
-{
-    if (page == "Artists" || page == "Artist") {
-        draw_text(x + 1, y, "A", 1, color);
-        return;
-    }
-    if (page == "Albums" || page == "Album" || label.find("Albums") != std::string::npos) {
-        lcd_fill_rect(x, y + 1, x + 8, y + 9, color);
-        lcd_fill_rect(x + 2, y + 3, x + 6, y + 7, lcd_color565(20, 18, 24));
-        return;
-    }
-    if (page == "Folder" || label.find("Folder") != std::string::npos) {
-        lcd_fill_rect(x, y + 3, x + 10, y + 9, color);
-        lcd_fill_rect(x + 1, y + 1, x + 5, y + 3, color);
-        return;
-    }
-    if (label.find("Shuffle") != std::string::npos) {
-        lcd_fill_rect(x, y + 2, x + 9, y + 3, color);
-        lcd_fill_rect(x, y + 8, x + 9, y + 9, color);
-        lcd_fill_rect(x + 7, y + 1, x + 10, y + 4, color);
-        lcd_fill_rect(x + 7, y + 7, x + 10, y + 10, color);
-        return;
-    }
-    if (label.find("Lo-Fi") != std::string::npos) {
-        lcd_fill_rect(x + 1, y + 2, x + 9, y + 3, color);
-        lcd_fill_rect(x + 1, y + 8, x + 9, y + 9, color);
-        lcd_fill_rect(x + 1, y + 2, x + 2, y + 9, color);
-        lcd_fill_rect(x + 8, y + 2, x + 9, y + 9, color);
-        return;
-    }
-    if (row == 0 || label.find("Now Playing") != std::string::npos) {
-        lcd_fill_rect(x + 2, y + 1, x + 3, y + 9, color);
-        lcd_fill_rect(x + 3, y + 1, x + 8, y + 2, color);
-        lcd_fill_rect(x + 7, y + 2, x + 8, y + 7, color);
-        lcd_fill_rect(x, y + 7, x + 3, y + 10, color);
-        return;
-    }
-    draw_text(x + 1, y, ">", 1, color);
-}
-
-void draw_radio_mark(int x, int y, bool selected, uint16_t color, uint16_t bg)
-{
-    lcd_fill_rect(x + 2, y, x + 6, y + 1, color);
-    lcd_fill_rect(x + 2, y + 7, x + 6, y + 8, color);
-    lcd_fill_rect(x, y + 2, x + 1, y + 6, color);
-    lcd_fill_rect(x + 7, y + 2, x + 8, y + 6, color);
-    lcd_fill_rect(x + 3, y + 3, x + 5, y + 6, selected ? color : bg);
-}
-
-void draw_soft_button(int x, int y, int w, const std::string &label, uint16_t fill, uint16_t ink)
-{
-    const std::string visible = localize_soft_key(label);
-    lcd_fill_rect(x + 2, y, x + w - 2, y + 1, fill);
-    lcd_fill_rect(x, y + 1, x + w, y + 11, fill);
-    lcd_fill_rect(x + 2, y + 12, x + w - 2, y + 13, fill);
-    draw_text(x + 9, y + 2, visible, 1, ink);
-}
-
-void draw_selected_row_frame(int x0, int y0, int x1, int y1, uint16_t fill, uint16_t accent)
-{
-    lcd_fill_rect(x0, y0, x1, y1, fill);
-    lcd_fill_rect(x0 + 1, y0, x1 - 1, y0 + 1, accent);
-    lcd_fill_rect(x0 + 1, y1 - 1, x1 - 1, y1, accent);
-    lcd_fill_rect(x0, y0 + 1, x0 + 1, y1 - 1, accent);
-    lcd_fill_rect(x1 - 1, y0 + 1, x1, y1 - 1, accent);
-}
-
-void draw_progress_bar(int x, int y, int w, int value, int max_value, uint16_t track, uint16_t fill)
-{
-    lcd_fill_rect(x, y, x + w, y + 5, track);
-    int filled = 0;
-    if (max_value > 0) {
-        filled = std::max(0, std::min(w, value * w / max_value));
-    }
-    if (filled > 0) {
-        lcd_fill_rect(x, y, x + filled, y + 5, fill);
-    }
-}
-
-void draw_slider(int x, int y, int w, int value, uint16_t track, uint16_t fill)
-{
-    value = std::max(0, std::min(10, value));
-    draw_progress_bar(x, y, w, value, 10, track, fill);
-    const int knob = x + std::max(0, std::min(w - 3, value * w / 10));
-    lcd_fill_rect(knob, y - 2, knob + 3, y + 7, fill);
-}
-
-int parse_row_value(const std::string &value)
-{
-    return std::max(0, std::min(100, std::atoi(value.c_str())));
-}
-
-void draw_album_thumb(int x, int y, int w, int h, uint16_t panel, uint16_t accent, uint16_t teal)
-{
-    lcd_fill_rect(x, y, x + w, y + h, panel);
-    lcd_fill_rect(x + 1, y + 1, x + w - 1, y + 2, teal);
-    lcd_fill_rect(x + 1, y + h - 2, x + w - 1, y + h - 1, teal);
-    lcd_fill_rect(x + 1, y + 1, x + 2, y + h - 1, teal);
-    lcd_fill_rect(x + w - 2, y + 1, x + w - 1, y + h - 1, teal);
-    const int cx = x + w / 2;
-    const int cy = y + h / 2;
-    lcd_fill_rect(cx - 5, cy - 5, cx + 5, cy + 5, accent);
-    lcd_fill_rect(cx - 13, cy - 8, cx - 11, cy + 9, teal);
-    lcd_fill_rect(cx + 11, cy - 8, cx + 13, cy + 9, teal);
-    lcd_fill_rect(cx - 14, cy - 9, cx + 14, cy - 7, teal);
-    lcd_fill_rect(cx - 14, cy + 7, cx + 14, cy + 9, teal);
-}
-
-void draw_playback_glyph(int x, int y, bool playing, uint16_t accent, uint16_t bg)
-{
-    if (playing) {
-        lcd_fill_rect(x, y, x + 8, y + 23, accent);
-        lcd_fill_rect(x + 15, y, x + 23, y + 23, accent);
-        return;
-    }
-    lcd_fill_rect(x, y, x + 4, y + 23, accent);
-    lcd_fill_rect(x + 4, y + 3, x + 8, y + 20, accent);
-    lcd_fill_rect(x + 8, y + 6, x + 12, y + 17, accent);
-    lcd_fill_rect(x + 12, y + 9, x + 16, y + 14, accent);
-    lcd_fill_rect(x + 16, y + 11, x + 20, y + 12, accent);
-    lcd_fill_rect(x, y, x + 1, y + 23, bg);
-}
-
-void draw_music_note_icon(int x, int y, uint16_t color)
-{
-    lcd_fill_rect(x + 4, y, x + 6, y + 11, color);
-    lcd_fill_rect(x + 6, y, x + 12, y + 2, color);
-    lcd_fill_rect(x + 10, y + 2, x + 12, y + 10, color);
-    lcd_fill_rect(x, y + 9, x + 6, y + 14, color);
-    lcd_fill_rect(x + 7, y + 8, x + 13, y + 13, color);
-}
-
-void draw_footer_separator(int x, uint16_t color)
-{
-    lcd_fill_rect(x, 120, x + 1, 132, color);
-}
-
-void draw_speaker_icon(int x, int y, uint16_t color)
-{
-    lcd_fill_rect(x, y + 4, x + 4, y + 10, color);
-    lcd_fill_rect(x + 4, y + 2, x + 8, y + 12, color);
-    lcd_fill_rect(x + 10, y + 4, x + 11, y + 10, color);
-    lcd_fill_rect(x + 12, y + 2, x + 13, y + 12, color);
-}
-
-void draw_repeat_icon(int x, int y, uint16_t color)
-{
-    lcd_fill_rect(x, y + 3, x + 12, y + 4, color);
-    lcd_fill_rect(x + 10, y + 1, x + 14, y + 6, color);
-    lcd_fill_rect(x + 2, y + 9, x + 14, y + 10, color);
-    lcd_fill_rect(x, y + 7, x + 4, y + 12, color);
-}
-
-void draw_queue_icon(int x, int y, uint16_t color)
-{
-    lcd_fill_rect(x, y + 2, x + 12, y + 4, color);
-    lcd_fill_rect(x, y + 6, x + 12, y + 8, color);
-    lcd_fill_rect(x, y + 10, x + 12, y + 12, color);
-    draw_text(x + 15, y + 3, ">", 1, color);
-}
-
-void draw_toast_overlay(const lofi::ScreenModel &screen,
-                        uint16_t panel,
-                        uint16_t panel2,
-                        uint16_t accent,
-                        uint16_t teal,
-                        uint16_t ink,
-                        uint16_t dim,
-                        uint16_t progress)
-{
-    if (screen.status.find("SD ") != std::string::npos) {
-        return;
-    }
-
-    const int x = 36;
-    const int y = 51;
-    const int w = 168;
-    const int h = 43;
-    lcd_fill_rect(x + 3, y + 3, x + w + 3, y + h + 3, panel2);
-    lcd_fill_rect(x + 4, y, x + w - 4, y + 1, accent);
-    lcd_fill_rect(x + 1, y + 1, x + w - 1, y + 3, accent);
-    lcd_fill_rect(x, y + 4, x + w, y + h - 4, panel);
-    lcd_fill_rect(x + 1, y + h - 3, x + w - 1, y + h - 1, accent);
-    lcd_fill_rect(x + 4, y + h - 1, x + w - 4, y + h, accent);
-
-    const int volume = parse_volume_toast(screen.status);
-    if (volume >= 0) {
-        draw_text(x + 22, y + 13, "VOLUME", 1, ink);
-        draw_text(x + 113, y + 10, std::to_string(volume) + "%", 2, accent);
-        draw_progress_bar(x + 52, y + 29, 96, volume, 100, progress, teal);
-        return;
-    }
-
-    draw_text(x + 18, y + 14, fit_label(screen.status, 31), 1, ink);
-    if (screen.status.rfind("Lo-Fi", 0) == 0 || screen.status.rfind("Repeat", 0) == 0 ||
-        screen.status.rfind("Shuffle", 0) == 0) {
-        draw_text(x + 18, y + 27, "SETTING UPDATED", 1, dim);
-    } else {
-        draw_text(x + 18, y + 27, "OK", 1, dim);
-    }
-}
-
-void draw_volume_focus_overlay(int volume,
-                               uint16_t panel,
-                               uint16_t panel2,
-                               uint16_t accent,
-                               uint16_t teal,
-                               uint16_t ink,
-                               uint16_t progress)
-{
-    const int x = 35;
-    const int y = 56;
-    const int w = 170;
-    const int h = 42;
-    lcd_fill_rect(x + 3, y + 3, x + w + 3, y + h + 3, panel2);
-    lcd_fill_rect(x + 4, y, x + w - 4, y + 1, accent);
-    lcd_fill_rect(x + 1, y + 1, x + w - 1, y + 3, accent);
-    lcd_fill_rect(x, y + 4, x + w, y + h - 4, panel);
-    lcd_fill_rect(x + 1, y + h - 3, x + w - 1, y + h - 1, accent);
-    lcd_fill_rect(x + 4, y + h - 1, x + w - 4, y + h, accent);
-    draw_text(x + 20, y + 13, "VOLUME", 1, ink);
-    draw_text(x + 112, y + 9, std::to_string(volume) + "%", 2, accent);
-    draw_progress_bar(x + 52, y + 29, 96, volume, 100, progress, teal);
 }
 
 esp_err_t try_new_i2c_bus(i2c_port_num_t port, const char *stage)
@@ -1200,6 +592,71 @@ lofi::Action keyboard_action_from_key(uint8_t row, uint8_t col)
     return lofi::Action::None;
 }
 
+bool keyboard_action_repeats(lofi::Action action)
+{
+    return action == lofi::Action::Up || action == lofi::Action::Down || action == lofi::Action::Left ||
+           action == lofi::Action::Right;
+}
+
+void keyboard_hold_begin(lofi::Action action, const char *key_name)
+{
+    if (!keyboard_action_repeats(action)) {
+        s_hold_active = false;
+        s_hold_action = lofi::Action::None;
+        return;
+    }
+    s_hold_active = true;
+    s_hold_action = action;
+    std::strncpy(s_hold_key_name, key_name, sizeof(s_hold_key_name) - 1);
+    s_hold_key_name[sizeof(s_hold_key_name) - 1] = '\0';
+    s_hold_started_tick = xTaskGetTickCount();
+    s_hold_last_emit_tick = s_hold_started_tick;
+    s_hold_repeat_count = 0;
+}
+
+void keyboard_hold_end(const char *key_name)
+{
+    if (s_hold_active && std::strcmp(s_hold_key_name, key_name) == 0) {
+        s_hold_active = false;
+        s_hold_action = lofi::Action::None;
+        s_hold_key_name[0] = '-';
+        s_hold_key_name[1] = '\0';
+    }
+}
+
+bool keyboard_hold_repeat(lofi::Action &action, const char **key_name)
+{
+    if (!s_hold_active || s_hold_action == lofi::Action::None) {
+        return false;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t held = now - s_hold_started_tick;
+    if (held < pdMS_TO_TICKS(430)) {
+        return false;
+    }
+
+    const TickType_t interval = s_hold_repeat_count < 4   ? pdMS_TO_TICKS(170)
+                                : s_hold_repeat_count < 12 ? pdMS_TO_TICKS(95)
+                                                           : pdMS_TO_TICKS(55);
+    if (now - s_hold_last_emit_tick < interval) {
+        return false;
+    }
+
+    s_hold_last_emit_tick = now;
+    ++s_hold_repeat_count;
+    action = s_hold_action;
+    std::strncpy(s_last_key_name, s_hold_key_name, sizeof(s_last_key_name) - 1);
+    s_last_key_name[sizeof(s_last_key_name) - 1] = '\0';
+    if (key_name) {
+        *key_name = s_last_key_name;
+    }
+    ESP_LOGI(TAG, "KBD_REPEAT key=%s action=%d count=%u",
+             s_last_key_name,
+             static_cast<int>(action),
+             static_cast<unsigned>(s_hold_repeat_count));
+    return true;
+}
+
 bool keyboard_poll(lofi::Action &action, const char **key_name)
 {
     if (!s_keyboard_ready) {
@@ -1208,12 +665,12 @@ bool keyboard_poll(lofi::Action &action, const char **key_name)
 
     uint8_t count = 0;
     if (i2c_read_reg(I2C_ADDR_TCA8418, TCA8418_REG_KEY_LCK_EC, &count, 1) != ESP_OK || (count & 0x0F) == 0) {
-        return false;
+        return keyboard_hold_repeat(action, key_name);
     }
 
     uint8_t raw = 0;
     if (i2c_read_reg(I2C_ADDR_TCA8418, TCA8418_REG_KEY_EVENT_A, &raw, 1) != ESP_OK || raw == 0) {
-        return false;
+        return keyboard_hold_repeat(action, key_name);
     }
     i2c_write_reg(I2C_ADDR_TCA8418, TCA8418_REG_INT_STAT, 0x01);
 
@@ -1238,10 +695,12 @@ bool keyboard_poll(lofi::Action &action, const char **key_name)
              static_cast<unsigned>(col),
              static_cast<int>(mapped_action));
     if (!pressed) {
+        keyboard_hold_end(s_last_key_name);
         return false;
     }
 
     action = mapped_action;
+    keyboard_hold_begin(action, s_last_key_name);
     if (action == lofi::Action::None) {
         if (std::strcmp(s_last_key_name, "C") == 0) {
             return true;
@@ -1258,6 +717,36 @@ lv_color_t lv_rgb(uint8_t r, uint8_t g, uint8_t b)
 
 const lv_font_t *lv_font_small(void)
 {
+    return &lofi_font_fusion_pixel_10;
+}
+
+const lv_font_t *lv_font_tiny(void)
+{
+    return &lofi_font_fusion_pixel_8;
+}
+
+const lv_font_t *lv_font_header(void)
+{
+    return &lofi_font_fusion_pixel_ui_16;
+}
+
+const lv_font_t *lv_font_now_chrome(void)
+{
+    return &lofi_font_fusion_pixel_ui_12;
+}
+
+const lv_font_t *lv_font_normal(void)
+{
+    return &lofi_font_fusion_pixel_ui_16;
+}
+
+const lv_font_t *lv_font_title(void)
+{
+    return &lofi_font_fusion_pixel_ui_20;
+}
+
+const lv_font_t *lv_font_symbol_small(void)
+{
 #if LV_FONT_MONTSERRAT_12
     return &lv_font_montserrat_12;
 #else
@@ -1265,16 +754,7 @@ const lv_font_t *lv_font_small(void)
 #endif
 }
 
-const lv_font_t *lv_font_header(void)
-{
-#if LV_FONT_MONTSERRAT_10
-    return &lv_font_montserrat_10;
-#else
-    return lv_font_small();
-#endif
-}
-
-const lv_font_t *lv_font_normal(void)
+const lv_font_t *lv_font_symbol_normal(void)
 {
 #if LV_FONT_MONTSERRAT_14
     return &lv_font_montserrat_14;
@@ -1283,7 +763,7 @@ const lv_font_t *lv_font_normal(void)
 #endif
 }
 
-const lv_font_t *lv_font_title(void)
+const lv_font_t *lv_font_symbol_title(void)
 {
 #if LV_FONT_MONTSERRAT_20
     return &lv_font_montserrat_20;
@@ -1294,57 +774,38 @@ const lv_font_t *lv_font_title(void)
 #endif
 }
 
-bool text_contains_non_ascii(const std::string &text)
+const lv_font_t *lv_font_large_symbol(void)
 {
-    return std::any_of(text.begin(), text.end(), [](unsigned char ch) {
-        return ch >= 0x80;
-    });
+#if LV_FONT_MONTSERRAT_24
+    return &lv_font_montserrat_24;
+#else
+    return lv_font_title();
+#endif
+}
+
+const lv_font_t *lv_font_home_label(void)
+{
+    return &lofi_font_fusion_pixel_ui_20;
 }
 
 const lv_font_t *lv_font_cjk(void)
 {
-#if LV_FONT_SOURCE_HAN_SANS_SC_16_CJK
-    return &lv_font_source_han_sans_sc_16_cjk;
-#elif LV_FONT_SOURCE_HAN_SANS_SC_14_CJK
-    return &lv_font_source_han_sans_sc_14_cjk;
-#else
-    return LV_FONT_DEFAULT;
-#endif
+    return &lofi_font_fusion_pixel_12;
 }
 
-void init_lvgl_font_fallbacks(void)
+const lv_font_t *lv_font_library_cjk(void)
 {
-    if (s_lvgl_font_fallbacks_ready) {
-        return;
-    }
-    const lv_font_t *cjk = lv_font_cjk();
-    s_lvgl_title_font = *lv_font_title();
-    s_lvgl_title_font.fallback = cjk;
-    s_lvgl_normal_font = *lv_font_normal();
-    s_lvgl_normal_font.fallback = cjk;
-    s_lvgl_small_font = *lv_font_small();
-    s_lvgl_small_font.fallback = cjk;
-    s_lvgl_font_fallbacks_ready = true;
+    return &lofi_font_fusion_pixel_10;
 }
 
-const lv_font_t *lv_font_with_cjk_fallback(const lv_font_t *latin_font)
+const lv_font_t *lv_font_library_cjk_large(void)
 {
-    init_lvgl_font_fallbacks();
-    if (latin_font == lv_font_title()) {
-        return &s_lvgl_title_font;
-    }
-    if (latin_font == lv_font_normal()) {
-        return &s_lvgl_normal_font;
-    }
-    if (latin_font == lv_font_small()) {
-        return &s_lvgl_small_font;
-    }
-    return latin_font;
+    return &lofi_font_fusion_pixel_12;
 }
 
-const lv_font_t *lv_font_for_text(const std::string &text, const lv_font_t *latin_font)
+const lv_font_t *lv_font_now_title(void)
 {
-    return text_contains_non_ascii(text) ? lv_font_with_cjk_fallback(latin_font) : latin_font;
+    return &lofi_font_fusion_pixel_14;
 }
 
 void lvgl_tick_timer_cb(void *)
@@ -1495,25 +956,106 @@ lv_obj_t *lv_label(lv_obj_t *parent,
     return label;
 }
 
-void clear_lvgl_scene(void)
+lv_obj_t *lv_clipped_label(lv_obj_t *parent,
+                           const std::string &text,
+                           int x,
+                           int y,
+                           int w,
+                           int h,
+                           int text_y,
+                           lv_color_t color,
+                           const lv_font_t *font,
+                           int scale = 256)
 {
-    if (!s_lvgl_display) {
-        return;
+    lv_obj_t *clip = lv_obj_create(parent);
+    lv_obj_set_pos(clip, x, y);
+    lv_obj_set_size(clip, w, h);
+    lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clip, 0, 0);
+    lv_obj_set_style_pad_all(clip, 0, 0);
+    lv_obj_set_style_radius(clip, 0, 0);
+    lv_obj_remove_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *label = lv_label_create(clip);
+    lv_obj_set_pos(label, 1, text_y);
+    lv_obj_set_width(label, w);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    if (scale != 256) {
+        lv_obj_set_style_transform_pivot_x(label, 0, 0);
+        lv_obj_set_style_transform_pivot_y(label, 0, 0);
+        lv_obj_set_style_transform_scale(label, scale, 0);
     }
-    lv_obj_t *root = lv_screen_active();
-    lv_obj_clean(root);
-    lv_obj_set_style_bg_color(root, lv_rgb(20, 18, 24), 0);
-    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-    lv_refr_now(s_lvgl_display);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(label, text.c_str());
+    return label;
+}
+
+int lv_text_width_px(const std::string &text, const lv_font_t *font)
+{
+    lv_point_t size = {};
+    lv_text_get_size(&size, text.c_str(), font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    return std::max<int>(0, size.x);
+}
+
+lv_obj_t *lv_marquee_label(lv_obj_t *parent,
+                           const std::string &text,
+                           int x,
+                           int y,
+                           int w,
+                           lv_color_t color,
+                           const lv_font_t *font,
+                           MarqueeState &state,
+                           const MarqueeTiming &timing,
+                           int clip_h = 0,
+                           int text_y = 0)
+{
+    const int line_height = std::max<int>(12, lv_font_get_line_height(font));
+    lv_obj_t *clip = lv_obj_create(parent);
+    lv_obj_set_pos(clip, x, y);
+    lv_obj_set_size(clip, w, clip_h > 0 ? clip_h : line_height + 2);
+    lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clip, 0, 0);
+    lv_obj_set_style_pad_all(clip, 0, 0);
+    lv_obj_set_style_radius(clip, 0, 0);
+    lv_obj_remove_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int text_width = lv_text_width_px(text, font);
+    const uint32_t now = now_ms();
+    int offset = 0;
+    if (text_width > w) {
+        const uint32_t span_px = static_cast<uint32_t>(text_width - w);
+        const uint32_t phase = marquee_phase_ms(state, text, now, span_px, timing.speed_px_per_sec, timing);
+        offset = -static_cast<int>(marquee_offset(phase, span_px, timing.speed_px_per_sec, timing));
+    } else {
+        reset_marquee_if_needed(state, text, now);
+    }
+
+    lv_obj_t *label = lv_label_create(clip);
+    lv_obj_set_pos(label, offset, text_y);
+    lv_obj_set_width(label, std::max(w, text_width + 2));
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(label, text.c_str());
+    return label;
 }
 
 void draw_lvgl_battery(lv_obj_t *root, lv_color_t ink, lv_color_t dim, lv_color_t fill)
 {
-    (void)ink;
-    (void)dim;
-    lv_obj_t *battery = lv_label(root, LV_SYMBOL_BATTERY_3, 219, 0, 20, fill, lv_font_normal());
-    lv_obj_set_style_text_align(battery, LV_TEXT_ALIGN_CENTER, 0);
+    const int x = 217;
+    const int y = 3;
+    lv_rect(root, x + 1, y, 17, 1, dim);
+    lv_rect(root, x, y + 1, 1, 8, dim);
+    lv_rect(root, x + 18, y + 1, 1, 8, dim);
+    lv_rect(root, x + 1, y + 9, 17, 1, dim);
+    lv_rect(root, x + 19, y + 3, 2, 4, dim);
+    lv_rect(root, x + 4, y + 3, 3, 4, fill);
+    lv_rect(root, x + 9, y + 3, 3, 4, fill);
+    lv_rect(root, x + 14, y + 3, 3, 4, fill);
+    lv_rect(root, x + 21, y + 4, 1, 2, ink);
 }
 
 void draw_lvgl_header(lv_obj_t *root,
@@ -1525,11 +1067,821 @@ void draw_lvgl_header(lv_obj_t *root,
                       lv_color_t line,
                       lv_color_t battery)
 {
-    lv_rect(root, 0, 0, LCD_WIDTH, 14, chrome);
-    lv_rect(root, 0, 14, LCD_WIDTH, 1, line);
-    lv_label(root, "LOFI", 4, 2, 42, accent, lv_font_header());
-    lv_label(root, title, 152, 2, 68, dim, lv_font_header());
+    lv_rect(root, 0, 0, LCD_WIDTH, 18, chrome);
+    lv_rect(root, 0, 18, LCD_WIDTH, 1, line);
+    lv_label(root, "LOFI", 4, 0, 54, accent, lv_font_header());
+    lv_obj_t *page = lv_label(root, title, 103, 0, 106, ink, lv_font_header());
+    lv_obj_set_style_text_align(page, LV_TEXT_ALIGN_RIGHT, 0);
     draw_lvgl_battery(root, ink, dim, battery);
+}
+
+void draw_lvgl_now_header(lv_obj_t *root,
+                          const std::string &title,
+                          lv_color_t chrome,
+                          lv_color_t accent,
+                          lv_color_t ink,
+                          lv_color_t dim,
+                          lv_color_t line,
+                          lv_color_t battery)
+{
+    lv_rect(root, 0, 0, LCD_WIDTH, 16, chrome);
+    lv_rect(root, 0, 16, LCD_WIDTH, 1, line);
+    lv_label(root, "LOFI", 4, 2, 48, accent, lv_font_now_chrome());
+    lv_obj_t *page = lv_label(root, title, 111, 2, 98, ink, lv_font_now_chrome());
+    lv_obj_set_style_text_align(page, LV_TEXT_ALIGN_RIGHT, 0);
+    draw_lvgl_battery(root, ink, dim, battery);
+}
+
+struct PlaybackSettingItem {
+    std::string label;
+    std::string value;
+    const char *symbol = "";
+    bool adjustable = true;
+    int volume = -1;
+};
+
+int selected_row_index(const lofi::ScreenModel &screen)
+{
+    for (size_t i = 0; i < screen.rows.size(); ++i) {
+        if (screen.rows[i].left.find('>') != std::string::npos) {
+            return static_cast<int>(i);
+        }
+    }
+    return 0;
+}
+
+const char *setting_symbol_for_label(const std::string &label)
+{
+    if (label == "Volume") {
+        return LV_SYMBOL_VOLUME_MAX;
+    }
+    if (label == "Brightness") {
+        return LV_SYMBOL_EYE_OPEN;
+    }
+    if (label == "Repeat") {
+        return LV_SYMBOL_LOOP;
+    }
+    if (label == "Shuffle") {
+        return LV_SYMBOL_SHUFFLE;
+    }
+    if (label == "Screen Off") {
+        return LV_SYMBOL_EYE_CLOSE;
+    }
+    if (label == "Queue") {
+        return LV_SYMBOL_LIST;
+    }
+    return LV_SYMBOL_SETTINGS;
+}
+
+PlaybackSettingItem setting_item_from_row(const lofi::ScreenLine &row)
+{
+    PlaybackSettingItem item;
+    item.label = strip_selection_marker(row.left);
+    item.value = row.right;
+    item.symbol = setting_symbol_for_label(item.label);
+    item.adjustable = item.label != "Queue";
+    if (item.label == "Volume" || item.label == "Brightness") {
+        item.volume = std::max(0, std::min(100, std::atoi(row.right.c_str())));
+    }
+    return item;
+}
+
+void draw_cut_corner_frame(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color, int thickness);
+
+std::string setting_display_label(const std::string &label)
+{
+    if (label == "Lo-Fi") {
+        return "LOFI";
+    }
+    if (label == "Brightness") {
+        return "BRIGHT";
+    }
+    if (label == "Screen Off") {
+        return "SLEEP";
+    }
+    std::string out = label;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return out;
+}
+
+void align_center(lv_obj_t *obj)
+{
+    lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+void draw_playback_setting_preview(lv_obj_t *root,
+                                   const PlaybackSettingItem &item,
+                                   int y,
+                                   lv_color_t panel,
+                                   lv_color_t ink,
+                                   lv_color_t dim,
+                                   lv_color_t line)
+{
+    lv_rect(root, 28, y, 181, 17, panel, 2, line, 1);
+    lv_obj_t *icon = lv_label(root, item.symbol, 36, y + 1, 18, dim, lv_font_symbol_small());
+    align_center(icon);
+    lv_label(root, setting_display_label(item.label), 62, y + 1, 84, dim, lv_font_small());
+    lv_obj_t *value = lv_label(root, item.value, 152, y + 1, 48, ink, lv_font_small());
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+}
+
+void draw_playback_setting_dots(lv_obj_t *root, int selected, int count, lv_color_t accent, lv_color_t line)
+{
+    const int x = 228;
+    const int y = 52;
+    for (int i = 0; i < count; ++i) {
+        lv_rect(root, x, y + i * 9, 4, 4, i == selected ? accent : line);
+    }
+}
+
+struct QueuePageInfo {
+    int first = 0;
+    int last = 0;
+    int total = 0;
+    int current = 0;
+};
+
+QueuePageInfo parse_queue_status(const std::string &status)
+{
+    QueuePageInfo info;
+    const char *text = status.c_str();
+    std::sscanf(text, "range=%d-%d/%d current=%d", &info.first, &info.last, &info.total, &info.current);
+    return info;
+}
+
+std::string library_header_title(const std::string &title)
+{
+    if (title == "Library Root") {
+        return "LIBRARY";
+    }
+    if (title == "Library Action") {
+        return "ACTION";
+    }
+    if (title == "Album") {
+        return "ALBUM";
+    }
+    if (title == "Artist") {
+        return "ARTIST";
+    }
+    std::string out = title;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return out;
+}
+
+std::string format_library_right(const std::string &right)
+{
+    if (right.empty() || right == "SD" || right.find('>') != std::string::npos) {
+        return right;
+    }
+    const int seconds = std::atoi(right.c_str());
+    if (seconds > 59 && right.find(':') == std::string::npos) {
+        return format_mmss(seconds);
+    }
+    return right;
+}
+
+bool contains_non_ascii(const std::string &value)
+{
+    for (unsigned char ch : value) {
+        if (ch >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void draw_library_header_text(lv_obj_t *root,
+                              const lofi::ScreenModel &screen,
+                              lv_color_t ink,
+                              lv_color_t dim)
+{
+    const bool subtitle_cjk = contains_non_ascii(screen.subtitle);
+    const bool meta_cjk = contains_non_ascii(screen.meta);
+    const lv_font_t *subtitle_font = subtitle_cjk ? lv_font_library_cjk() : lv_font_tiny();
+    const lv_font_t *meta_font = meta_cjk ? lv_font_library_cjk() : lv_font_tiny();
+    const int subtitle_h = subtitle_cjk ? 17 : 12;
+    const int meta_h = meta_cjk ? 17 : 12;
+    const int subtitle_text_y = subtitle_cjk ? -2 : -1;
+    const int meta_text_y = meta_cjk ? -2 : -1;
+
+    if (!screen.subtitle.empty()) {
+        lv_clipped_label(root, screen.subtitle, 9, 20, 132, subtitle_h, subtitle_text_y, ink, subtitle_font);
+    }
+    if (!screen.meta.empty()) {
+        lv_obj_t *clip = lv_obj_create(root);
+        lv_obj_set_pos(clip, 137, 20);
+        lv_obj_set_size(clip, 94, meta_h);
+        lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(clip, 0, 0);
+        lv_obj_set_style_pad_all(clip, 0, 0);
+        lv_obj_set_style_radius(clip, 0, 0);
+        lv_obj_remove_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *meta = lv_label_create(clip);
+        lv_obj_set_pos(meta, 0, meta_text_y);
+        lv_obj_set_width(meta, 94);
+        lv_obj_set_style_text_color(meta, dim, 0);
+        lv_obj_set_style_text_font(meta, meta_font, 0);
+        lv_obj_set_style_text_align(meta, meta_cjk ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_bg_opa(meta, LV_OPA_TRANSP, 0);
+        lv_label_set_long_mode(meta, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(meta, screen.meta.c_str());
+    }
+}
+
+void draw_lvgl_library_row(lv_obj_t *root,
+                           const lofi::ScreenLine &row,
+                           int y,
+                           bool selected,
+                           bool action_style,
+                           const lv_font_t *row_font,
+                           int row_h,
+                           lv_color_t bg,
+                           lv_color_t panel,
+                           lv_color_t accent,
+                           lv_color_t teal,
+                           lv_color_t ink,
+                           lv_color_t dim,
+                           lv_color_t line)
+{
+    std::string left = strip_selection_marker(row.left);
+    const bool checkbox = left.rfind("[x] ", 0) == 0 || left.rfind("[ ] ", 0) == 0;
+    const bool checked = left.rfind("[x] ", 0) == 0;
+    if (checkbox) {
+        left = left.substr(4);
+    }
+
+    if (selected) {
+        const int x = action_style ? 42 : 8;
+        const int w = action_style ? 156 : 224;
+        lv_rect(root, x, y, w, row_h, panel, 2, line, 1);
+        lv_rect(root, x + 3, y + 2, 3, row_h - 4, teal);
+        lv_rect(root, x + 8, y + 2, w - 12, row_h - 4, bg, 1);
+    } else if (!action_style) {
+        lv_rect(root, 10, y + row_h, 220, 1, line);
+    } else {
+        lv_rect(root, 44, y + row_h, 152, 1, line);
+    }
+
+    int text_x = action_style ? 58 : 17;
+    int text_w = action_style ? 126 : 150;
+    const int text_y = y + (!action_style && row_h > 20 ? 2 : 0);
+    if (checkbox) {
+        lv_rect(root, 17, y + std::max(4, (row_h - 5) / 2), 5, 5, checked ? teal : bg, 0, checked ? teal : dim, 1);
+        text_x = 30;
+        text_w = 142;
+    } else if (action_style) {
+        const char *symbol = LV_SYMBOL_RIGHT;
+        if (left == "ADD TO END" || left == "ADD TO FRONT") {
+            symbol = LV_SYMBOL_PLUS;
+        } else if (left == "CANCEL") {
+            symbol = LV_SYMBOL_CLOSE;
+        } else if (left == "REPLACE QUEUE") {
+            symbol = LV_SYMBOL_SHUFFLE;
+        }
+        lv_obj_t *icon = lv_label(root, symbol, 47, y + 1, 11, selected ? accent : teal, lv_font_symbol_small());
+        lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    }
+
+    const lv_color_t text_color = selected ? ink : dim;
+    if (selected && lv_text_width_px(left, row_font) > text_w) {
+        const MarqueeTiming timing{2200, 1600, 0, 18, 780};
+        lv_marquee_label(root, left, text_x, text_y - 1, text_w, text_color, row_font, s_library_marquee, timing, row_h + 2, -1);
+    } else {
+        lv_clipped_label(root, left, text_x, text_y, text_w, row_h + 1, 0, text_color, row_font);
+    }
+
+    const std::string right = format_library_right(row.right);
+    if (!right.empty()) {
+        lv_obj_t *value = lv_label(root, right, action_style ? 158 : 174, y + (row_h > 20 ? 3 : 1), action_style ? 28 : 54,
+                                   selected ? accent : dim,
+                                   lv_font_tiny());
+        lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+}
+
+esp_err_t draw_screen_lvgl_library_list(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t panel = lv_rgb(35, 32, 44);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root, library_header_title(screen.title), chrome, accent, ink, dim, line, accent);
+
+    draw_library_header_text(root, screen, ink, dim);
+
+    const bool action_style = screen.title == "Library Action";
+    const bool root_style = screen.title == "Library Root";
+    const bool dense_header = contains_non_ascii(screen.subtitle) || contains_non_ascii(screen.meta);
+    const int row_h = action_style ? 17 : (root_style ? 20 : 25);
+    const int first_y = action_style ? 48 : (screen.subtitle.empty() && screen.meta.empty() ? 24 : (dense_header ? 32 : 31));
+    const int step = action_style ? 17 : (root_style ? 20 : 25);
+    const size_t max_rows = root_style ? 5 : 4;
+    const lv_font_t *row_font = action_style ? lv_font_small() : (root_style ? lv_font_library_cjk() : lv_font_library_cjk_large());
+    if (action_style) {
+        lv_rect(root, 37, 42, 166, 91, lv_rgb(24, 22, 31), 2, line, 1);
+    }
+    for (size_t i = 0; i < screen.rows.size() && i < max_rows; ++i) {
+        const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
+        draw_lvgl_library_row(root,
+                              screen.rows[i],
+                              first_y + static_cast<int>(i) * step,
+                              selected,
+                              action_style,
+                              row_font,
+                              row_h,
+                              bg,
+                              panel,
+                              accent,
+                              teal,
+                              ink,
+                              dim,
+                              line);
+    }
+
+    if (action_style) {
+        lv_label(root, "BACK", 10, 120, 42, teal, lv_font_tiny());
+        lv_obj_t *ok = lv_label(root, "OK", 200, 120, 30, teal, lv_font_tiny());
+        lv_obj_set_style_text_align(ok, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
+}
+
+void draw_lvgl_queue_row(lv_obj_t *root,
+                         const lofi::ScreenLine &row,
+                         int y,
+                         bool selected,
+                         lv_color_t bg,
+                         lv_color_t panel,
+                         lv_color_t accent,
+                         lv_color_t teal,
+                         lv_color_t ink,
+                         lv_color_t dim,
+                         lv_color_t line)
+{
+    const bool now = row.right == "NOW" || row.left.find('*') != std::string::npos;
+    const std::string title = strip_selection_marker(row.left);
+    const lv_color_t title_color = selected ? ink : (now ? teal : dim);
+    const lv_color_t index_color = now ? accent : (selected ? teal : dim);
+    const int row_h = 17;
+
+    if (selected) {
+        lv_rect(root, 8, y, 224, row_h, panel, 2, line, 1);
+        lv_rect(root, 11, y + 2, 3, row_h - 4, teal);
+        lv_rect(root, 16, y + 2, 213, row_h - 4, bg, 1);
+    } else {
+        lv_rect(root, 10, y + row_h, 220, 1, line);
+    }
+
+    if (now) {
+        lv_label(root, LV_SYMBOL_PLAY, 17, y + 2, 12, accent, lv_font_symbol_small());
+    } else {
+        lv_obj_t *index = lv_label(root, row.right, 10, y + 2, 27, index_color, lv_font_small());
+        lv_obj_set_style_text_align(index, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+
+    const int title_w = selected ? 125 : 152;
+    if (selected) {
+        const MarqueeTiming queue_timing{2200, 1600, 0, 18, 780};
+        lv_marquee_label(root, title, 43, y, title_w, title_color, lv_font_cjk(), s_queue_marquee, queue_timing, row_h, -1);
+    } else {
+        lv_clipped_label(root, title, 43, y, title_w, row_h, -1, title_color, lv_font_cjk());
+    }
+
+    if (selected) {
+        lv_obj_t *tag = lv_label(root, now ? "NOW" : "PLAY", 188, y + 2, 32, now ? accent : teal, lv_font_small());
+        lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
+    } else if (now) {
+        lv_obj_t *tag = lv_label(root, "NOW", 191, y + 2, 29, accent, lv_font_small());
+        lv_obj_set_style_text_align(tag, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+}
+
+int repeat_indicator_index(const std::string &value)
+{
+    if (value == "One") {
+        return 1;
+    }
+    if (value == "Album") {
+        return 2;
+    }
+    if (value == "All") {
+        return 3;
+    }
+    return 0;
+}
+
+int screen_off_seconds_from_setting_value(const std::string &value)
+{
+    if (value == "Forever") {
+        return 0;
+    }
+    int seconds = std::atoi(value.c_str());
+    if (value.find('m') != std::string::npos) {
+        seconds *= 60;
+    }
+    return seconds;
+}
+
+int screen_off_choice_index_from_value(const std::string &value)
+{
+    constexpr int choices[] = {10, 15, 20, 30, 60, 120, 180, 300, 600, 0};
+    const int seconds = screen_off_seconds_from_setting_value(value);
+    if (seconds <= 0) {
+        return static_cast<int>(sizeof(choices) / sizeof(choices[0])) - 1;
+    }
+    int best_index = 0;
+    int best_distance = std::abs(seconds - choices[0]);
+    for (int i = 1; i < static_cast<int>(sizeof(choices) / sizeof(choices[0])); ++i) {
+        const int distance = std::abs(seconds - choices[i]);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = i;
+        }
+    }
+    return best_index;
+}
+
+void draw_screen_off_discrete_timeline(lv_obj_t *root,
+                                       const std::string &value,
+                                       lv_color_t accent,
+                                       lv_color_t teal,
+                                       lv_color_t line,
+                                       lv_color_t progress)
+{
+    constexpr int kX = 82;
+    constexpr int kY = 86;
+    constexpr int kW = 96;
+    constexpr int kChoices = 10;
+    const int active = screen_off_choice_index_from_value(value);
+
+    lv_rect(root, kX, kY + 6, kW, 2, progress);
+    for (int i = 0; i < kChoices; ++i) {
+        const int cx = kX + (kW * i + (kChoices - 2) / 2) / (kChoices - 1);
+        if (i < active) {
+            lv_rect(root, cx - 2, kY + 4, 4, 4, accent, 2);
+        } else if (i == active) {
+            lv_rect(root, cx - 4, kY + 2, 8, 8, teal, 4, accent, 1);
+        } else {
+            lv_rect(root, cx - 2, kY + 4, 4, 4, line, 2);
+        }
+    }
+}
+
+void draw_lvgl_setting_switch(lv_obj_t *root,
+                              int x,
+                              int y,
+                              bool on,
+                              lv_color_t accent,
+                              lv_color_t ink,
+                              lv_color_t line,
+                              lv_color_t progress)
+{
+#if LV_USE_SWITCH
+    lv_obj_t *sw = lv_switch_create(root);
+    lv_obj_set_pos(sw, x, y);
+    lv_obj_set_size(sw, 44, 16);
+    lv_obj_remove_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+    if (on) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    lv_obj_set_style_bg_color(sw, progress, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(sw, line, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sw, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(sw, 8, LV_PART_MAIN);
+    const lv_style_selector_t checked_indicator =
+        static_cast<lv_style_selector_t>(LV_PART_INDICATOR) | static_cast<lv_style_selector_t>(LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, accent, checked_indicator);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, checked_indicator);
+    lv_obj_set_style_radius(sw, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sw, ink, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(sw, 6, LV_PART_KNOB);
+#else
+    lv_rect(root, x, y + 3, 42, 10, on ? accent : progress, 5, line, 1);
+    lv_rect(root, on ? x + 28 : x + 4, y + 5, 6, 6, ink);
+#endif
+}
+
+void draw_playback_setting_card(lv_obj_t *root,
+                                const PlaybackSettingItem &item,
+                                lv_color_t bg,
+                                lv_color_t panel,
+                                lv_color_t accent,
+                                lv_color_t teal,
+                                lv_color_t ink,
+                                lv_color_t dim,
+                                lv_color_t line,
+                                lv_color_t progress)
+{
+    lv_rect(root, 14, 43, 207, 66, panel, 6, line, 1);
+    draw_cut_corner_frame(root, 14, 43, 207, 66, teal, 2);
+    lv_rect(root, 18, 47, 199, 58, bg, 4);
+
+    lv_obj_t *icon = lv_label(root, item.symbol, 26, 57, 42, teal, lv_font_large_symbol());
+    align_center(icon);
+
+    lv_label(root, setting_display_label(item.label), 73, 52, 72, ink, lv_font_normal());
+    const lv_font_t *value_font = item.value.size() > 3 ? lv_font_home_label() : lv_font_title();
+    lv_obj_t *value = lv_label(root, item.value, 134, 50, 70, ink, value_font);
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+
+    if (item.adjustable) {
+        lv_obj_t *left = lv_label(root, LV_SYMBOL_LEFT, 60, 75, 14, accent, lv_font_symbol_normal());
+        align_center(left);
+        lv_obj_t *right = lv_label(root, LV_SYMBOL_RIGHT, 204, 75, 14, accent, lv_font_symbol_normal());
+        align_center(right);
+    } else {
+        lv_obj_t *right = lv_label(root, LV_SYMBOL_RIGHT, 204, 75, 14, accent, lv_font_symbol_normal());
+        align_center(right);
+    }
+
+    if (item.volume >= 0) {
+        lv_rect(root, 76, 89, 122, 9, progress, 0, line, 1);
+        const int fill = std::max(0, std::min(118, 118 * item.volume / 100));
+        if (fill > 0) {
+            lv_rect(root, 78, 92, fill, 3, accent);
+        }
+    } else if (item.label == "Repeat") {
+        const int active = repeat_indicator_index(item.value);
+        for (int i = 0; i < 4; ++i) {
+            lv_rect(root, 81 + i * 16, 90, 9, 5, i == active ? accent : line);
+        }
+    } else if (item.label == "Shuffle") {
+        const bool on = item.value == "On";
+        draw_lvgl_setting_switch(root, 82, 86, on, accent, ink, line, progress);
+    } else if (item.label == "Screen Off") {
+        draw_screen_off_discrete_timeline(root, item.value, accent, teal, line, progress);
+    } else {
+        lv_rect(root, 82, 89, 82, 2, line);
+        lv_rect(root, 82, 94, 44, 2, accent);
+    }
+}
+
+lv_obj_t *lv_plain_container(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *obj = lv_obj_create(parent);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_set_style_radius(obj, 0, 0);
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    return obj;
+}
+
+void draw_cut_corner_frame(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color, int thickness = 2)
+{
+    lv_rect(parent, x + 8, y, w - 16, thickness, color);
+    lv_rect(parent, x + 8, y + h - thickness, w - 16, thickness, color);
+    lv_rect(parent, x, y + 8, thickness, h - 16, color);
+    lv_rect(parent, x + w - thickness, y + 8, thickness, h - 16, color);
+
+    for (int i = 0; i < 4; ++i) {
+        const int o = i * 2;
+        lv_rect(parent, x + 2 + o, y + 6 - o, thickness, thickness, color);
+        lv_rect(parent, x + w - 4 - o, y + 6 - o, thickness, thickness, color);
+        lv_rect(parent, x + 2 + o, y + h - 8 + o, thickness, thickness, color);
+        lv_rect(parent, x + w - 4 - o, y + h - 8 + o, thickness, thickness, color);
+    }
+}
+
+struct HomeItem {
+    const char *label;
+    const lv_image_dsc_t *center_icon;
+    const lv_image_dsc_t *side_icon;
+};
+
+const HomeItem *home_items(size_t &count)
+{
+    static const HomeItem items[] = {
+        {"LIBRARY", &library_center_rgb565, &library_side_rgb565},
+        {"QUEUE", &queue_center_rgb565, &queue_side_rgb565},
+        {"LOFI", &lofi_center_rgb565, &lofi_side_rgb565},
+        {"SETTINGS", &settings_center_rgb565, &settings_side_rgb565},
+        {"NOW", &now_center_rgb565, &now_side_rgb565},
+    };
+    count = sizeof(items) / sizeof(items[0]);
+    return items;
+}
+
+int selected_home_index(const lofi::ScreenModel &screen)
+{
+    for (size_t i = 0; i < screen.rows.size(); ++i) {
+        if (screen.rows[i].left.find('>') != std::string::npos) {
+            return static_cast<int>(std::min<size_t>(i, 4));
+        }
+    }
+    return 0;
+}
+
+int wrap_home_index(int index, int count)
+{
+    if (count <= 0) {
+        return 0;
+    }
+    while (index < 0) {
+        index += count;
+    }
+    return index % count;
+}
+
+void anim_set_x(void *obj, int32_t value)
+{
+    lv_obj_set_x(static_cast<lv_obj_t *>(obj), value);
+}
+
+void anim_set_y(void *obj, int32_t value)
+{
+    lv_obj_set_y(static_cast<lv_obj_t *>(obj), value);
+}
+
+void anim_set_opa(void *obj, int32_t value)
+{
+    lv_obj_set_style_opa(static_cast<lv_obj_t *>(obj), static_cast<lv_opa_t>(value), 0);
+}
+
+void start_home_anim(lv_obj_t *obj,
+                     lv_anim_exec_xcb_t exec,
+                     int32_t start,
+                     int32_t end,
+                     uint16_t duration_ms,
+                     uint16_t delay_ms = 0)
+{
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, obj);
+    lv_anim_set_values(&anim, start, end);
+    lv_anim_set_duration(&anim, duration_ms);
+    lv_anim_set_delay(&anim, delay_ms);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&anim, exec);
+    lv_anim_start(&anim);
+}
+
+void draw_home_icon(lv_obj_t *parent, const lv_image_dsc_t *icon, int x, int y, lv_opa_t opa)
+{
+    lv_obj_t *image = lv_image_create(parent);
+    lv_image_set_src(image, icon);
+    lv_obj_set_pos(image, x, y);
+    lv_obj_set_style_opa(image, opa, 0);
+}
+
+void draw_home_stage(lv_obj_t *parent,
+                     const HomeItem *items,
+                     int count,
+                     int selected,
+                     lv_color_t accent,
+                     lv_color_t teal,
+                     lv_color_t line)
+{
+    const int previous = wrap_home_index(selected - 1, count);
+    const int next = wrap_home_index(selected + 1, count);
+
+    draw_cut_corner_frame(parent, -21, 33, 61, 54, line, 2);
+    draw_cut_corner_frame(parent, 201, 33, 61, 54, line, 2);
+    draw_home_icon(parent, items[previous].side_icon, -35, 16, LV_OPA_70);
+    draw_home_icon(parent, items[next].side_icon, 206, 16, LV_OPA_70);
+
+    lv_obj_t *left = lv_label(parent, "<", 50, 52, 26, accent, lv_font_title());
+    lv_obj_set_style_text_align(left, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *right = lv_label(parent, ">", 164, 52, 26, accent, lv_font_title());
+    lv_obj_set_style_text_align(right, LV_TEXT_ALIGN_CENTER, 0);
+
+    draw_cut_corner_frame(parent, 75, 4, 90, 80, teal, 2);
+    draw_home_icon(parent, items[selected].center_icon, 82, 5, LV_OPA_COVER);
+}
+
+void draw_home_caption(lv_obj_t *parent,
+                       const HomeItem *items,
+                       int count,
+                       int selected,
+                       int y_offset,
+                       lv_color_t accent,
+                       lv_color_t ink,
+                       lv_color_t line)
+{
+    lv_obj_t *name = lv_label(parent, items[selected].label, 0, 88, LCD_WIDTH, ink, lv_font_home_label());
+    lv_obj_set_y(name, y_offset + 88);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+
+    const int dot_y = y_offset + 110;
+    const int dot_gap = 13;
+    const int dots_w = static_cast<int>(count - 1) * dot_gap + 4;
+    int dot_x = (LCD_WIDTH - dots_w) / 2;
+    for (int i = 0; i < count; ++i) {
+        lv_rect(parent, dot_x + i * dot_gap, dot_y, 4, 4, i == selected ? accent : line);
+    }
+}
+
+void draw_home_page(lv_obj_t *parent,
+                    const HomeItem *items,
+                    int count,
+                    int selected,
+                    lv_color_t accent,
+                    lv_color_t teal,
+                    lv_color_t ink,
+                    lv_color_t line)
+{
+    draw_home_stage(parent, items, count, selected, accent, teal, line);
+    draw_home_caption(parent, items, count, selected, 0, accent, ink, line);
+}
+
+esp_err_t draw_screen_lvgl_home(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    size_t item_count = 0;
+    const HomeItem *items = home_items(item_count);
+    const int count = static_cast<int>(item_count);
+    const int selected = std::min(std::max(selected_home_index(screen), 0), count - 1);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root, "HOME", chrome, accent, ink, dim, line, accent);
+
+    constexpr int kBodyY = 19;
+    constexpr int kStageHeight = 90;
+    constexpr uint16_t kStageAnimMs = 300;
+    constexpr uint16_t kCaptionAnimMs = 180;
+    lv_obj_t *stage_viewport = lv_plain_container(root, 0, kBodyY, LCD_WIDTH, kStageHeight);
+    const int previous_selected = s_home_last_selected;
+    const bool animate = previous_selected >= 0 && previous_selected < count && previous_selected != selected;
+    if (animate) {
+        int dir = selected > previous_selected ? 1 : -1;
+        if (previous_selected == 0 && selected == count - 1) {
+            dir = -1;
+        } else if (previous_selected == count - 1 && selected == 0) {
+            dir = 1;
+        }
+
+        lv_obj_t *strip = lv_plain_container(stage_viewport,
+                                             dir > 0 ? 0 : -LCD_WIDTH,
+                                             0,
+                                             LCD_WIDTH * 2,
+                                             kStageHeight);
+        lv_obj_t *old_page = lv_plain_container(strip, dir > 0 ? 0 : LCD_WIDTH, 0, LCD_WIDTH, kStageHeight);
+        draw_home_stage(old_page, items, count, previous_selected, accent, teal, line);
+        lv_obj_t *new_page = lv_plain_container(strip, dir > 0 ? LCD_WIDTH : 0, 0, LCD_WIDTH, kStageHeight);
+        draw_home_stage(new_page, items, count, selected, accent, teal, line);
+
+        start_home_anim(strip, anim_set_x, dir > 0 ? 0 : -LCD_WIDTH, dir > 0 ? -LCD_WIDTH : 0, kStageAnimMs);
+
+        lv_obj_t *old_caption = lv_plain_container(root, 0, kBodyY, LCD_WIDTH, LCD_HEIGHT - kBodyY);
+        draw_home_caption(old_caption, items, count, previous_selected, 0, accent, ink, line);
+        start_home_anim(old_caption, anim_set_y, kBodyY, kBodyY - 3, kCaptionAnimMs);
+        start_home_anim(old_caption, anim_set_opa, LV_OPA_COVER, LV_OPA_TRANSP, kCaptionAnimMs);
+
+        lv_obj_t *new_caption = lv_plain_container(root, 0, kBodyY + 4, LCD_WIDTH, LCD_HEIGHT - kBodyY);
+        lv_obj_set_style_opa(new_caption, LV_OPA_TRANSP, 0);
+        draw_home_caption(new_caption, items, count, selected, 0, accent, ink, line);
+        start_home_anim(new_caption, anim_set_y, kBodyY + 4, kBodyY, kCaptionAnimMs, 70);
+        start_home_anim(new_caption, anim_set_opa, LV_OPA_TRANSP, LV_OPA_COVER, kCaptionAnimMs, 70);
+    } else {
+        lv_obj_t *page = lv_plain_container(root, 0, kBodyY, LCD_WIDTH, LCD_HEIGHT - kBodyY);
+        draw_home_page(page, items, count, selected, accent, teal, ink, line);
+    }
+    s_home_last_selected = selected;
+
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
 }
 
 void draw_lvgl_footer_button(lv_obj_t *root,
@@ -1550,16 +1902,16 @@ void draw_lvgl_footer_button(lv_obj_t *root,
     lv_obj_set_style_text_align(text, LV_TEXT_ALIGN_CENTER, 0);
 }
 
-void draw_lvgl_soft_footer(lv_obj_t *root,
-                           const std::string &left,
-                           const std::string &center,
-                           const std::string &right,
-                           bool center_active,
-                           lv_color_t chrome,
-                           lv_color_t panel,
-                           lv_color_t active_fill,
-                           lv_color_t ink,
-                           lv_color_t line)
+[[maybe_unused]] void draw_lvgl_soft_footer(lv_obj_t *root,
+                                            const std::string &left,
+                                            const std::string &center,
+                                            const std::string &right,
+                                            bool center_active,
+                                            lv_color_t chrome,
+                                            lv_color_t panel,
+                                            lv_color_t active_fill,
+                                            lv_color_t ink,
+                                            lv_color_t line)
 {
     lv_rect(root, 0, 117, LCD_WIDTH, 18, chrome);
     lv_rect(root, 0, 117, LCD_WIDTH, 1, line);
@@ -1576,29 +1928,29 @@ void draw_lvgl_now_playing_footer(lv_obj_t *root,
                                   lv_color_t dim,
                                   lv_color_t line)
 {
-    lv_rect(root, 0, 119, LCD_WIDTH, 16, chrome);
-    lv_rect(root, 0, 119, LCD_WIDTH, 1, line);
+    lv_rect(root, 0, 121, LCD_WIDTH, 14, chrome);
+    lv_rect(root, 0, 121, LCD_WIDTH, 1, line);
 
-    lv_obj_t *note = lv_label(root, LV_SYMBOL_AUDIO, 8, 121, 24, teal, lv_font_normal());
+    lv_obj_t *note = lv_label(root, LV_SYMBOL_AUDIO, 8, 121, 22, teal, lv_font_symbol_small());
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label(root, "MENU", 36, 121, 44, ink, lv_font_normal());
+    lv_label(root, "MENU", 36, 123, 42, ink, lv_font_now_chrome());
 
-    lv_rect(root, 104, 121, 1, 11, line);
-    lv_obj_t *volume = lv_label(root, LV_SYMBOL_VOLUME_MID, 111, 121, 20, teal, lv_font_normal());
+    lv_rect(root, 104, 123, 1, 9, line);
+    lv_obj_t *volume = lv_label(root, LV_SYMBOL_VOLUME_MID, 111, 121, 20, teal, lv_font_symbol_small());
     lv_obj_set_style_text_align(volume, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_rect(root, 138, 121, 1, 11, line);
-    lv_obj_t *repeat = lv_label(root, LV_SYMBOL_LOOP, 144, 121, 22, accent, lv_font_normal());
+    lv_rect(root, 138, 123, 1, 9, line);
+    lv_obj_t *repeat = lv_label(root, LV_SYMBOL_LOOP, 144, 121, 22, accent, lv_font_symbol_small());
     lv_obj_set_style_text_align(repeat, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_rect(root, 172, 121, 1, 11, line);
-    lv_obj_t *lofi = lv_label(root, "LOFI", 178, 121, 25, teal, lv_font_small());
+    lv_rect(root, 172, 123, 1, 9, line);
+    lv_obj_t *lofi = lv_label(root, "LOFI", 178, 123, 29, teal, lv_font_now_chrome());
     lv_obj_set_style_text_align(lofi, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_rect(root, 209, 121, 1, 11, line);
-    lv_obj_t *queue = lv_label(root, LV_SYMBOL_LIST, 216, 121, 16, ink, lv_font_normal());
+    lv_rect(root, 209, 123, 1, 9, line);
+    lv_obj_t *queue = lv_label(root, LV_SYMBOL_LIST, 216, 121, 16, ink, lv_font_symbol_small());
     lv_obj_set_style_text_align(queue, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *queue_plus = lv_label(root, LV_SYMBOL_PLUS, 230, 124, 8, ink, lv_font_small());
+    lv_obj_t *queue_plus = lv_label(root, LV_SYMBOL_PLUS, 230, 123, 8, ink, lv_font_symbol_small());
     lv_obj_set_style_text_align(queue_plus, LV_TEXT_ALIGN_CENTER, 0);
 }
 
@@ -1670,7 +2022,7 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "RECORDED", chrome, accent, ink, dim, line, accent);
+    draw_lvgl_now_header(root, "RECORDED", chrome, accent, ink, dim, line, accent);
     draw_lvgl_album_art(root, panel, bg, accent, teal, dim, line);
 
     const std::string title = !screen.rows.empty() ? screen.rows[0].left : "No track selected";
@@ -1678,21 +2030,23 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
     const bool playing = !screen.rows.empty() && screen.rows[0].right == ">";
     const int pos = screen.position_seconds > 0 ? screen.position_seconds : parse_position_seconds(screen);
     const int duration = std::max(0, screen.duration_seconds);
-    lv_label(root, title, 96, 30, 136, ink, lv_font_for_text(title, lv_font_title()), LV_LABEL_LONG_SCROLL);
-    lv_label(root, artist, 97, 58, 110, dim, lv_font_for_text(artist, lv_font_normal()), LV_LABEL_LONG_SCROLL);
+    const MarqueeTiming title_timing{2200, 1600, 0, 18, 780};
+    const MarqueeTiming artist_timing{2600, 1600, 400, 15, 900};
+    lv_marquee_label(root, title, 95, 27, 138, ink, lv_font_now_title(), s_title_marquee, title_timing, 25, -2);
+    lv_marquee_label(root, artist, 96, 52, 126, dim, lv_font_cjk(), s_artist_marquee, artist_timing, 20, -2);
 
-    lv_obj_t *playback = lv_label(root, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, 96, 76, 28, accent, lv_font_title());
+    lv_obj_t *playback = lv_label(root, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, 96, 78, 28, accent, lv_font_symbol_title());
     lv_obj_set_style_text_align(playback, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label(root, format_mmss(pos), 130, 82, 46, ink, lv_font_normal());
-    lv_label(root, "/", 179, 82, 8, dim, lv_font_small());
-    lv_label(root, duration > 0 ? format_mmss(duration) : "--:--", 190, 82, 42, dim, lv_font_small());
+    lv_label(root, format_mmss(pos), 130, 84, 46, ink, lv_font_normal());
+    lv_label(root, "/", 179, 84, 8, dim, lv_font_small());
+    lv_label(root, duration > 0 ? format_mmss(duration) : "--:--", 190, 84, 42, dim, lv_font_small());
 
     const int progress_width = 130;
     const int progress_max = std::max(1, duration);
     const int progress_value = duration > 0 ? std::min(progress_width, std::max(0, pos) * progress_width / progress_max) : 0;
-    lv_rect(root, 96, 105, progress_width, 6, progress, 0, line, 1);
+    lv_rect(root, 96, 109, progress_width, 6, progress, 0, line, 1);
     if (progress_value > 3) {
-        lv_rect(root, 98, 107, progress_value - 3, 2, accent);
+        lv_rect(root, 98, 111, progress_value - 3, 2, accent);
     }
 
     draw_lvgl_now_playing_footer(root, chrome, accent, teal, ink, dim, line);
@@ -1708,9 +2062,10 @@ esp_err_t draw_screen_lvgl_playback_menu(const lofi::ScreenModel &screen)
 
     const lv_color_t bg = lv_rgb(20, 18, 24);
     const lv_color_t chrome = lv_rgb(13, 12, 16);
-    const lv_color_t panel = lv_rgb(36, 32, 43);
-    const lv_color_t selected = lv_rgb(69, 48, 34);
+    const lv_color_t panel = lv_rgb(35, 32, 44);
+    const lv_color_t preview = lv_rgb(28, 25, 35);
     const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
     const lv_color_t ink = lv_rgb(248, 233, 207);
     const lv_color_t dim = lv_rgb(162, 152, 138);
     const lv_color_t line = lv_rgb(69, 60, 71);
@@ -1722,37 +2077,250 @@ esp_err_t draw_screen_lvgl_playback_menu(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "RECORDED", chrome, accent, ink, dim, line, accent);
-    lv_rect(root, 14, 26, 212, 86, panel, 3, line, 1);
-    lv_label(root, "Playback Menu", 24, 32, 130, ink, lv_font_normal());
+    draw_lvgl_header(root, "SETTINGS", chrome, accent, ink, dim, line, accent);
 
-    for (size_t i = 0; i < screen.rows.size() && i < 4; ++i) {
-        const std::string left = strip_selection_marker(screen.rows[i].left);
-        const bool row_selected = screen.rows[i].left.find('>') != std::string::npos;
-        const int y = 54 + static_cast<int>(i) * 14;
-        if (row_selected) {
-            lv_rect(root, 22, y - 2, 196, 13, selected, 2);
-        }
-        lv_label(root, left, 28, y - 3, 88, row_selected ? ink : dim, lv_font_small());
-        if (left == "Volume") {
-            const int volume = std::max(0, std::min(100, std::atoi(screen.rows[i].right.c_str())));
-            lv_rect(root, 104, y + 2, 70, 4, progress);
-            lv_rect(root, 104, y + 2, 70 * volume / 100, 4, accent);
-        }
-        lv_label(root, screen.rows[i].right, 178, y - 3, 38, row_selected ? ink : dim, lv_font_small());
+    std::vector<PlaybackSettingItem> items;
+    items.reserve(screen.rows.size());
+    for (const auto &row : screen.rows) {
+        items.push_back(setting_item_from_row(row));
+    }
+    if (items.empty()) {
+        items.push_back({"Volume", "0%", LV_SYMBOL_VOLUME_MAX, true, 0});
     }
 
-    const lv_color_t footer_active = lv_rgb(92, 60, 37);
-    draw_lvgl_soft_footer(root,
-                          screen.soft_left,
-                          screen.soft_center,
-                          screen.soft_right,
-                          true,
-                          chrome,
-                          panel,
-                          footer_active,
-                          ink,
-                          line);
+    const int selected = std::max(0, std::min<int>(selected_row_index(screen), static_cast<int>(items.size()) - 1));
+    const bool warning_status = screen.status.find("Distortion risk") != std::string::npos;
+    if (warning_status) {
+        lv_rect(root, 22, 23, 196, 15, preview, 2, accent, 1);
+        lv_clipped_label(root, "DISTORTION RISK - PRESS AGAIN", 29, 24, 184, 13, -2, accent, lv_font_small());
+    } else if (selected > 0) {
+        draw_playback_setting_preview(root, items[selected - 1], 21, preview, ink, dim, line);
+    } else if (items.size() > 1) {
+        draw_playback_setting_preview(root, items[items.size() - 1], 21, preview, ink, dim, line);
+    }
+
+    draw_playback_setting_card(root, items[selected], bg, panel, accent, teal, ink, dim, line, progress);
+
+    if (selected + 1 < static_cast<int>(items.size())) {
+        draw_playback_setting_preview(root, items[selected + 1], 113, preview, ink, dim, line);
+    } else if (items.size() > 1) {
+        draw_playback_setting_preview(root, items[0], 113, preview, ink, dim, line);
+    }
+
+    draw_playback_setting_dots(root, selected, static_cast<int>(items.size()), accent, line);
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
+}
+
+esp_err_t draw_screen_lvgl_queue(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t panel = lv_rgb(35, 32, 44);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root, "QUEUE", chrome, accent, ink, dim, line, accent);
+
+    const QueuePageInfo info = parse_queue_status(screen.status);
+    if (info.total <= 0 || screen.rows.empty()) {
+        lv_label(root, LV_SYMBOL_LIST, 101, 42, 38, teal, lv_font_large_symbol());
+        lv_obj_t *empty = lv_label(root, "QUEUE EMPTY", 0, 75, LCD_WIDTH, ink, lv_font_normal());
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_refr_now(s_lvgl_display);
+        return ESP_OK;
+    }
+
+    char range[24] = {};
+    std::snprintf(range, sizeof(range), "%03d-%03d / %03d", info.first, info.last, info.total);
+    lv_label(root, range, 10, 20, 116, dim, lv_font_tiny());
+
+    lv_obj_t *jump_icon = lv_label(root, LV_SYMBOL_RIGHT, 182, 20, 13, accent, lv_font_symbol_small());
+    lv_obj_set_style_text_align(jump_icon, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_t *jump = lv_label(root, "+6", 198, 20, 31, accent, lv_font_tiny());
+    lv_obj_set_style_text_align(jump, LV_TEXT_ALIGN_RIGHT, 0);
+
+    lv_rect(root, 10, 33, 220, 1, line);
+    constexpr int kRowY = 35;
+    constexpr int kRowStep = 17;
+    constexpr int kListH = 102;
+    for (size_t i = 0; i < screen.rows.size() && i < 6; ++i) {
+        const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
+        draw_lvgl_queue_row(root,
+                            screen.rows[i],
+                            kRowY + static_cast<int>(i) * kRowStep,
+                            selected,
+                            bg,
+                            panel,
+                            accent,
+                            teal,
+                            ink,
+                            dim,
+                            line);
+    }
+
+    const int total = std::max(1, info.total);
+    const int first = std::max(1, info.first);
+    const int last = std::max(first, info.last);
+    const int thumb_y = kRowY + (first - 1) * kListH / total;
+    const int thumb_h = std::max(6, (last - first + 1) * kListH / total);
+    lv_rect(root, 234, kRowY, 2, kListH, line);
+    lv_rect(root, 233, thumb_y, 4, std::min(kListH - (thumb_y - kRowY), thumb_h), accent);
+
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
+}
+
+esp_err_t draw_screen_lvgl_lofi(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t panel = lv_rgb(35, 32, 44);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root, "LO-FI", chrome, accent, ink, dim, line, accent);
+    const bool edit_mode = screen.title == "Lo-Fi Edit";
+    lv_label(root, edit_mode ? "EDIT" : "LO-FI", 10, 21, 86, ink, edit_mode ? lv_font_header() : lv_font_title());
+    lv_obj_t *summary = lv_label(root, lofi_strength_summary(screen.status, screen.meta), 124, 24, 106, accent, lv_font_small());
+    lv_obj_set_style_text_align(summary, LV_TEXT_ALIGN_RIGHT, 0);
+
+    const int row_y = edit_mode ? 38 : 40;
+    const int row_h = edit_mode ? 18 : 21;
+    const int row_step = edit_mode ? 19 : 22;
+    const size_t max_rows = edit_mode ? 5 : 4;
+    for (size_t i = 0; i < screen.rows.size() && i < max_rows; ++i) {
+        std::string left = strip_selection_marker(screen.rows[i].left);
+        const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
+        const int y = row_y + static_cast<int>(i) * row_step;
+        if (selected) {
+            lv_rect(root, 8, y, 224, row_h, panel, 2, line, 1);
+            lv_rect(root, 11, y + 2, 3, row_h - 4, teal);
+            lv_rect(root, 16, y + 2, 213, row_h - 4, bg, 1);
+        } else {
+            lv_rect(root, 12, y + row_h, 216, 1, line);
+        }
+
+        const lv_font_t *row_font = contains_non_ascii(left) ? lv_font_library_cjk_large() : lv_font_normal();
+        const int text_y = edit_mode ? y : y + 2;
+        const int label_w = edit_mode ? 88 : 142;
+        lv_clipped_label(root, left, 28, text_y, label_w, row_h, -1, selected ? ink : dim, row_font);
+        if (!screen.rows[i].right.empty()) {
+            const lv_font_t *value_font = edit_mode ? lv_font_header() : lv_font_normal();
+            lv_obj_t *value = lv_label(root,
+                                       screen.rows[i].right,
+                                       edit_mode ? 180 : 177,
+                                       text_y,
+                                       edit_mode ? 42 : 47,
+                                       selected ? accent : dim,
+                                       value_font);
+            lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+            if (edit_mode) {
+                const int amount = std::max(0, std::min(100, std::atoi(screen.rows[i].right.c_str())));
+                constexpr int bar_x = 118;
+                constexpr int bar_w = 54;
+                constexpr int bar_h = 4;
+                const int bar_y = y + row_h - 6;
+                lv_rect(root, bar_x, bar_y, bar_w, bar_h, line, 0);
+                lv_rect(root, bar_x, bar_y, std::max(1, bar_w * amount / 100), bar_h, selected ? accent : teal, 0);
+            }
+        }
+    }
+
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
+}
+
+esp_err_t draw_screen_lvgl_generic(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t panel = lv_rgb(35, 32, 44);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root, library_header_title(screen.title), chrome, accent, ink, dim, line, accent);
+    lv_clipped_label(root, library_header_title(screen.title), 10, 23, 156, 21, -1, ink, lv_font_title());
+    if (!screen.status.empty()) {
+        lv_clipped_label(root,
+                         screen.status,
+                         11,
+                         48,
+                         218,
+                         17,
+                         -1,
+                         dim,
+                         contains_non_ascii(screen.status) ? lv_font_library_cjk() : lv_font_small());
+    }
+
+    constexpr int kRowY = 70;
+    constexpr int kRowH = 17;
+    constexpr int kRowStep = 18;
+    for (size_t i = 0; i < screen.rows.size() && i < 3; ++i) {
+        std::string left = strip_selection_marker(screen.rows[i].left);
+        const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
+        const int y = kRowY + static_cast<int>(i) * kRowStep;
+        if (selected) {
+            lv_rect(root, 8, y, 224, kRowH, panel, 2, line, 1);
+            lv_rect(root, 11, y + 2, 3, kRowH - 4, teal);
+            lv_rect(root, 16, y + 2, 213, kRowH - 4, bg, 1);
+        } else {
+            lv_rect(root, 12, y + kRowH, 216, 1, line);
+        }
+        lv_clipped_label(root,
+                         left,
+                         28,
+                         y,
+                         143,
+                         kRowH,
+                         -1,
+                         selected ? ink : dim,
+                         contains_non_ascii(left) ? lv_font_library_cjk() : lv_font_small());
+        if (!screen.rows[i].right.empty()) {
+            lv_obj_t *value = lv_label(root, localize_right_label(screen.rows[i].right), 178, y, 47, selected ? accent : dim, lv_font_small());
+            lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+        }
+    }
+
     lv_refr_now(s_lvgl_display);
     return ESP_OK;
 }
@@ -1799,15 +2367,52 @@ esp_err_t init_display(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_lcd_panel, LCD_MIRROR_X, LCD_MIRROR_Y), TAG, "lcd mirror");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG, "lcd on");
 
-    gpio_config_t bl_cfg = {};
-    bl_cfg.pin_bit_mask = 1ULL << PIN_LCD_BL;
-    bl_cfg.mode = GPIO_MODE_OUTPUT;
-    ESP_RETURN_ON_ERROR(gpio_config(&bl_cfg), TAG, "lcd bl gpio");
-    gpio_set_level(static_cast<gpio_num_t>(PIN_LCD_BL), 1);
+    ledc_timer_config_t bl_timer = {};
+    bl_timer.speed_mode = kBacklightLedcMode;
+    bl_timer.duty_resolution = kBacklightLedcResolution;
+    bl_timer.timer_num = kBacklightLedcTimer;
+    bl_timer.freq_hz = 5000;
+    bl_timer.clk_cfg = LEDC_AUTO_CLK;
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&bl_timer), TAG, "lcd bl timer");
+
+    ledc_channel_config_t bl_channel = {};
+    bl_channel.gpio_num = PIN_LCD_BL;
+    bl_channel.speed_mode = kBacklightLedcMode;
+    bl_channel.channel = kBacklightLedcChannel;
+    bl_channel.intr_type = LEDC_INTR_DISABLE;
+    bl_channel.timer_sel = kBacklightLedcTimer;
+    bl_channel.duty = kBacklightLedcMaxDuty;
+    bl_channel.hpoint = 0;
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&bl_channel), TAG, "lcd bl ledc");
+    s_backlight_pwm_ready = true;
+    s_screen_awake = true;
+    apply_backlight();
 
     ESP_RETURN_ON_ERROR(lcd_draw_solid(lcd_color565(8, 12, 18)), TAG, "lcd clear");
     ESP_RETURN_ON_ERROR(init_lvgl_display(), TAG, "lvgl init");
     return ESP_OK;
+}
+
+void set_screen_awake(bool awake)
+{
+    s_screen_awake = awake;
+    apply_backlight();
+}
+
+bool screen_awake(void)
+{
+    return s_screen_awake;
+}
+
+void set_screen_brightness_percent(int percent)
+{
+    s_screen_brightness_percent = normalize_backlight_percent(percent);
+    ESP_LOGI(TAG,
+             "BACKLIGHT brightness=%d duty=%u/%u",
+             s_screen_brightness_percent,
+             static_cast<unsigned>(backlight_duty_for_state()),
+             static_cast<unsigned>(kBacklightLedcMaxDuty));
+    apply_backlight();
 }
 
 esp_err_t draw_screen(const lofi::ScreenModel &screen)
@@ -1815,276 +2420,45 @@ esp_err_t draw_screen(const lofi::ScreenModel &screen)
     if (!s_lcd_panel) {
         return ESP_ERR_INVALID_STATE;
     }
+    const uint16_t lvgl_bg = lcd_color565(20, 18, 24);
     if (screen.title == "Now Playing" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "now preclear");
         return draw_screen_lvgl_now_playing(screen);
     }
     if (screen.title == "Playback Menu" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "playback menu preclear");
         return draw_screen_lvgl_playback_menu(screen);
     }
-    clear_lvgl_scene();
-
-    const uint16_t bg = lcd_color565(20, 18, 24);
-    const uint16_t chrome = lcd_color565(13, 12, 16);
-    const uint16_t panel = lcd_color565(44, 40, 53);
-    const uint16_t panel2 = lcd_color565(44, 40, 53);
-    const uint16_t accent = lcd_color565(245, 174, 94);
-    const uint16_t accent2 = lcd_color565(69, 51, 44);
-    const uint16_t teal = lcd_color565(125, 205, 205);
-    const uint16_t ink = lcd_color565(248, 233, 207);
-    const uint16_t dim = lcd_color565(162, 152, 138);
-    const uint16_t line = lcd_color565(69, 60, 71);
-    const uint16_t progress = lcd_color565(51, 45, 55);
-
-    ESP_RETURN_ON_ERROR(lcd_draw_solid(bg), TAG, "clear screen");
-    ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 0, LCD_WIDTH, 14, chrome), TAG, "top chrome");
-    ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 14, LCD_WIDTH, 15, line), TAG, "top line");
-    draw_text(4, 3, "LOFI", 1, accent);
-    draw_text(132, 3, fit_label(localize_title(screen.title), 20), 1, dim);
-
-    bool suppress_toast = false;
-    if (screen.title == "Now Playing") {
-        const bool playing = !screen.rows.empty() && screen.rows[0].right == ">";
-        const std::string title = screen.rows.empty() ? "No Track" : strip_selection_marker(screen.rows[0].left);
-        const std::string artist_album = screen.rows.size() > 1 ? screen.rows[1].left : "Open Library";
-        const int pos = screen.position_seconds > 0 ? screen.position_seconds : parse_position_seconds(screen);
-        const int duration = std::max(0, screen.duration_seconds);
-        const int volume_toast = parse_volume_toast(screen.status);
-        const size_t scroll_phase = static_cast<size_t>(xTaskGetTickCount() / pdMS_TO_TICKS(600));
-
-        if (volume_toast >= 0) {
-            draw_text(82, 30, marquee_label(title, 18, scroll_phase), 2, ink);
-            draw_text(82, 55, marquee_label(artist_album, 30, scroll_phase / 2), 1, teal);
-            draw_volume_focus_overlay(volume_toast, panel, panel2, accent, teal, ink, progress);
-            suppress_toast = true;
-        } else {
-
-            draw_album_thumb(6, 31, 66, 66, panel, accent, teal);
-            draw_text(82, 30, marquee_label(title, 18, scroll_phase), 2, ink);
-            draw_text(82, 55, marquee_label(artist_album, 30, scroll_phase / 2), 1, teal);
-            draw_playback_glyph(82, 75, playing, accent, bg);
-
-            const int progress_pos = duration > 0 ? std::min(duration, std::max(0, pos)) : 0;
-            draw_text(124, 78, format_mmss(pos), 2, ink);
-            draw_text(184, 82, duration > 0 ? format_mmss(duration) : "--:--", 1, dim);
-            draw_progress_bar(82, 104, 150, progress_pos, std::max(1, duration), progress, accent);
-        }
-    } else if (screen.title == "Lo-Fi Edit") {
-        draw_text(8, 22, fit_label(localize_title(screen.title), 18), 2, ink);
-        int y = 44;
-        for (size_t i = 0; i < screen.rows.size() && i < 4; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            const std::string left = localize_row_left(strip_selection_marker(screen.rows[i].left));
-            const int value = parse_row_value(screen.rows[i].right) / 10;
-            draw_text(12, y - 6, fit_label(left, 13), 1, selected ? ink : dim);
-            draw_text(94, y - 5, std::to_string(value), 1, selected ? accent : dim);
-            draw_slider(126, y - 2, 96, value, progress, selected ? teal : dim);
-            y += 20;
-        }
-        draw_text_tiny(8, 107, "LEFT/RIGHT ADJUST ENTER SAVE", dim);
-    } else if (screen.title == "Album" || screen.title == "Album Detail") {
-        const std::string album = screen.rows.empty() ? "Album" : screen.rows[0].left;
-        const std::string count = screen.rows.empty() ? "" : screen.rows[0].right;
-        draw_text(8, 21, localize_title(screen.title), 2, ink);
-        draw_album_thumb(9, 39, 42, 42, panel, accent, teal);
-        draw_text(60, 36, fit_label(album, 20), 2, ink);
-        draw_text(61, 57, fit_label(count.empty() ? "PLAY ALBUM" : count + " tracks", 20), 1, teal);
-        draw_text_tiny(61, 69, "ENTER PLAYS ALBUM", dim);
-        int y = 82;
-        for (size_t i = 1; i < screen.rows.size() && i < 4; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            if (selected) {
-                draw_selected_row_frame(7, y - 3, LCD_WIDTH - 7, y + 14, accent2, accent);
-            } else {
-                ESP_RETURN_ON_ERROR(lcd_fill_rect(8, y + 13, LCD_WIDTH - 8, y + 14, line), TAG, "album row separator");
-            }
-            draw_text(13, y, fit_label(strip_selection_marker(screen.rows[i].left), 27), 1, selected ? ink : dim);
-            y += 17;
-        }
-    } else if (screen.title == "Folder") {
-        draw_text(8, 22, "Loose Files", 2, ink);
-        draw_text(9, 42, "/Music / Inbox", 1, dim);
-        const size_t max_rows = 3;
-        size_t start = 0;
-        if (screen.rows.size() > max_rows) {
-            for (size_t i = 0; i < screen.rows.size(); ++i) {
-                if (!screen.rows[i].left.empty() && screen.rows[i].left[0] == '>') {
-                    if (i >= max_rows) {
-                        start = i - max_rows + 1;
-                    }
-                    break;
-                }
-            }
-        }
-        int y = 55;
-        for (size_t i = start; i < screen.rows.size() && i < start + max_rows; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            const std::string title = strip_selection_marker(screen.rows[i].left);
-            if (selected) {
-                draw_selected_row_frame(6, y - 4, LCD_WIDTH - 6, y + 18, accent2, accent);
-            } else {
-                ESP_RETURN_ON_ERROR(lcd_fill_rect(7, y + 17, LCD_WIDTH - 7, y + 18, line), TAG, "folder row separator");
-            }
-            draw_list_icon(14, y + 1, screen.title, "Folder", i - start, selected ? teal : dim);
-            draw_text(31, y - 1, fit_label(title, 21), 1, selected ? ink : dim);
-            draw_text_tiny(31, y + 13, selected ? "ENTER PLAYS FILE" : fit_label(screen.rows[i].right, 18), dim);
-            if (!screen.rows[i].right.empty()) {
-                lcd_fill_rect(196, y, 233, y + 13, selected ? panel : panel2);
-                draw_text(201, y + 2, fit_label(screen.rows[i].right, 7), 1, selected ? teal : dim);
-            }
-            y += 23;
-        }
-    } else if (screen.title == "Scan") {
-        int tracks = 0;
-        int albums = 0;
-        if (!screen.rows.empty()) {
-            tracks = parse_row_value(screen.rows[0].right);
-        }
-        if (screen.rows.size() > 1) {
-            albums = parse_row_value(screen.rows[1].right);
-        }
-        draw_text(8, 22, "Scan Music", 2, ink);
-        draw_text(8, 43, "/Music", 1, dim);
-        const int progress_max = std::max(1, tracks + std::max(48, albums * 2));
-        draw_progress_bar(8, 62, 224, tracks, progress_max, progress, teal);
-        draw_text(8, 81, std::to_string(albums) + " albums / " + std::to_string(tracks) + " tracks", 1, ink);
-        draw_text_tiny(8, 100, "READING /Music", dim);
-        if (screen.rows.size() > 3 && !screen.rows[3].left.empty()) {
-            draw_text_tiny(8, 110, fit_label(screen.rows[3].left, 30), dim);
-        }
-    } else if (screen.title == "Queue") {
-        draw_text(8, 22, "Queue", 2, ink);
-        std::string current = "Current queue";
-        size_t total_rows = screen.rows.size();
-        for (const lofi::ScreenLine &row : screen.rows) {
-            if (row.right == "NOW" || row.left.find('*') != std::string::npos) {
-                current = "Now " + fit_label(strip_selection_marker(row.left), 18);
-                break;
-            }
-        }
-        for (const lofi::ScreenLine &row : screen.rows) {
-            const int value = parse_row_value(row.right);
-            if (value > 0) {
-                total_rows = std::max(total_rows, static_cast<size_t>(value));
-            }
-        }
-        draw_text_tiny(8, 40, current, dim);
-        draw_text_tiny(171, 40, std::to_string(total_rows) + " tracks", dim);
-
-        const size_t max_rows = 3;
-        int y = 50;
-        for (size_t i = 0; i < screen.rows.size() && i < max_rows; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            const bool now = screen.rows[i].right == "NOW" || screen.rows[i].left.find('*') != std::string::npos;
-            const std::string title = strip_selection_marker(screen.rows[i].left);
-            if (selected) {
-                draw_selected_row_frame(6, y - 4, LCD_WIDTH - 6, y + 18, accent2, accent);
-            } else {
-                ESP_RETURN_ON_ERROR(lcd_fill_rect(7, y + 17, LCD_WIDTH - 7, y + 18, line), TAG, "queue row separator");
-            }
-            draw_text(14, y, now ? ">" : screen.rows[i].right, 1, now ? teal : dim);
-            draw_text(31, y - 1, fit_label(title, 20), 1, selected ? ink : dim);
-            draw_text_tiny(31, y + 13, now ? "NOW PLAYING" : "NEXT", dim);
-            if (!screen.rows[i].right.empty()) {
-                lcd_fill_rect(196, y, 233, y + 13, selected ? panel : panel2);
-                draw_text(201, y + 2, fit_label(localize_right_label(screen.rows[i].right), 7), 1, now ? teal : (selected ? accent : dim));
-            }
-            y += 23;
-        }
-        draw_text_tiny(8, 106, "UP/DOWN MOVE ENTER PLAY", dim);
-    } else if (screen.title == "Lo-Fi") {
-        draw_text(8, 22, "Lo-Fi", 2, ink);
-        draw_text_tiny(156, 31, lofi_strength_summary(screen.status), accent);
-        int y = 43;
-        for (size_t i = 0; i < screen.rows.size() && i < 3; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            const std::string left = localize_row_left(strip_selection_marker(screen.rows[i].left));
-            if (selected) {
-                draw_selected_row_frame(6, y - 4, LCD_WIDTH - 6, y + 18, accent2, accent);
-            } else {
-                ESP_RETURN_ON_ERROR(lcd_fill_rect(7, y + 17, LCD_WIDTH - 7, y + 18, line), TAG, "lofi row separator");
-            }
-            draw_radio_mark(12, y + 1, selected, selected ? accent : dim, bg);
-            draw_text(27, y - 1, fit_label(left, 17), 1, selected ? ink : dim);
-            const std::string hint = row_hint(screen.title, left, screen.rows[i].right);
-            if (!hint.empty()) {
-                draw_text_tiny(27, y + 13, fit_label(hint, 25), dim);
-            }
-            if (!screen.rows[i].right.empty()) {
-                lcd_fill_rect(196, y, 233, y + 13, selected ? panel : panel2);
-                draw_text(201, y + 2, fit_label(screen.rows[i].right, 7), 1, selected ? teal : dim);
-            }
-            y += 23;
-        }
-        draw_text_tiny(8, 106, "BACK ENTER APPLY MENU EDIT", dim);
-    } else {
-        draw_text(8, 22, localize_title(screen.title), 2, ink);
-        const bool rich_rows = screen.title == "Library";
-        int y = rich_rows ? 38 : 40;
-        const int step = rich_rows ? 24 : 21;
-        const size_t max_rows = rich_rows ? 3 : 4;
-        size_t start = 0;
-        if (rich_rows && screen.rows.size() > max_rows) {
-            for (size_t i = 0; i < screen.rows.size(); ++i) {
-                if (!screen.rows[i].left.empty() && screen.rows[i].left[0] == '>') {
-                    if (i >= max_rows) {
-                        start = i - max_rows + 1;
-                    }
-                    break;
-                }
-            }
-        }
-        for (size_t i = start; i < screen.rows.size() && i < start + max_rows; ++i) {
-            const bool selected = !screen.rows[i].left.empty() && screen.rows[i].left[0] == '>';
-            const std::string left = localize_row_left(strip_selection_marker(screen.rows[i].left));
-            if (selected) {
-                draw_selected_row_frame(6, y - 3, LCD_WIDTH - 6, y + (rich_rows ? 19 : 16), accent2, accent);
-            } else {
-                const int sep_y = y + (rich_rows ? 18 : 15);
-                ESP_RETURN_ON_ERROR(lcd_fill_rect(7, sep_y, LCD_WIDTH - 7, sep_y + 1, line), TAG, "row separator");
-            }
-            draw_list_icon(13, y + 1, screen.title, left, i - start, selected ? teal : dim);
-            if (rich_rows) {
-                draw_text(31, y - 1, fit_label(left, 17), 1, selected ? ink : dim);
-            } else {
-                draw_text(31, y - 1, fit_label(left, 17), 1, selected ? ink : dim);
-            }
-            const std::string hint = row_hint(screen.title, left, screen.rows[i].right);
-            if (!hint.empty()) {
-                draw_text_tiny(31, y + (rich_rows ? 14 : 12), fit_label(hint, rich_rows ? 24 : 26), dim);
-            }
-            if (!screen.rows[i].right.empty()) {
-                lcd_fill_rect(196, y, 233, y + 13, selected ? panel : panel2);
-                draw_text(201, y + 2, fit_label(localize_right_label(screen.rows[i].right), 7), 1, selected ? teal : dim);
-            }
-            y += step;
-        }
+    if (screen.title == "Library" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "home preclear");
+        return draw_screen_lvgl_home(screen);
     }
-
-    if (!suppress_toast) {
-        draw_toast_overlay(screen, panel, panel2, accent, teal, ink, dim, progress);
+    if (screen.title == "Queue" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "queue preclear");
+        return draw_screen_lvgl_queue(screen);
     }
-
-    if (screen.title == "Now Playing") {
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 117, LCD_WIDTH, LCD_HEIGHT, chrome), TAG, "compact footer chrome");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 117, LCD_WIDTH, 118, line), TAG, "compact footer line");
-        draw_music_note_icon(8, 121, teal);
-        draw_text(27, 123, "MENU", 1, ink);
-        draw_footer_separator(128, line);
-        draw_speaker_icon(138, 121, teal);
-        draw_footer_separator(158, line);
-        draw_repeat_icon(168, 121, accent);
-        draw_footer_separator(188, line);
-        draw_text(196, 123, "LOFI", 1, teal);
-        draw_footer_separator(217, line);
-        draw_queue_icon(224, 121, ink);
-    } else {
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 115, LCD_WIDTH, LCD_HEIGHT, chrome), TAG, "footer chrome");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(0, 115, LCD_WIDTH, 116, line), TAG, "footer line");
-        draw_soft_button(6, 119, 63, screen.soft_left, panel2, ink);
-        draw_soft_button(89, 119, 63, screen.soft_center, panel2, ink);
-        draw_soft_button(171, 119, 63, screen.soft_right, panel2, ink);
+    if ((screen.title == "Lo-Fi" || screen.title == "Lo-Fi Edit") && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "lofi preclear");
+        return draw_screen_lvgl_lofi(screen);
     }
-    return ESP_OK;
+    if ((screen.title == "Library Root" || screen.title == "Songs" || screen.title == "Artists" ||
+         screen.title == "Artist" || screen.title == "Albums" || screen.title == "Album" ||
+         screen.title == "Folders" || screen.title == "Folder" || screen.title == "Playlists" ||
+         screen.title == "Playlist" || screen.title == "Library Action") &&
+        s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "library preclear");
+        return draw_screen_lvgl_library_list(screen);
+    }
+    if ((screen.title == "Scan" || screen.title == "Scan Music") && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "generic preclear");
+        return draw_screen_lvgl_generic(screen);
+    }
+    if (s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "generic fallback preclear");
+        return draw_screen_lvgl_generic(screen);
+    }
+    ESP_LOGE(TAG, "LVGL display unavailable; cannot draw screen %s", screen.title.c_str());
+    return ESP_ERR_INVALID_STATE;
 }
 
 void tick_display(void)
@@ -2092,49 +2466,6 @@ void tick_display(void)
     if (s_lvgl_display) {
         lv_timer_handler();
     }
-}
-
-esp_err_t draw_color_test(void)
-{
-    clear_lvgl_scene();
-    ESP_RETURN_ON_ERROR(lcd_draw_solid(lcd_color565(0, 0, 0)), TAG, "color test clear");
-    draw_text(6, 4, "RGB COLOR TEST", 1, lcd_color565(255, 255, 255));
-    draw_text_tiny(132, 5, "C=TEST D=DUMP", lcd_color565(180, 180, 180));
-
-    struct Swatch {
-        const char *label;
-        uint8_t r;
-        uint8_t g;
-        uint8_t b;
-    };
-    constexpr Swatch swatches[] = {
-        {"RED", 255, 0, 0},
-        {"GREEN", 0, 255, 0},
-        {"BLUE", 0, 0, 255},
-        {"YELLOW", 255, 255, 0},
-        {"CYAN", 0, 255, 255},
-        {"MAGENTA", 255, 0, 255},
-        {"WHITE", 255, 255, 255},
-        {"BLACK", 0, 0, 0},
-    };
-
-    for (size_t i = 0; i < sizeof(swatches) / sizeof(swatches[0]); ++i) {
-        const int col = static_cast<int>(i % 4);
-        const int row = static_cast<int>(i / 4);
-        const int x = 8 + col * 58;
-        const int y = 24 + row * 45;
-        const Swatch &s = swatches[i];
-        const uint16_t color = lcd_color565(s.r, s.g, s.b);
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(x, y, x + 32, y + 20, color), TAG, "color test swatch");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(x - 1, y - 1, x + 33, y, lcd_color565(96, 96, 96)), TAG, "color test border");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(x - 1, y + 20, x + 33, y + 21, lcd_color565(96, 96, 96)), TAG, "color test border");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(x - 1, y - 1, x, y + 21, lcd_color565(96, 96, 96)), TAG, "color test border");
-        ESP_RETURN_ON_ERROR(lcd_fill_rect(x + 32, y - 1, x + 33, y + 21, lcd_color565(96, 96, 96)), TAG, "color test border");
-        draw_text_tiny(x, y + 25, s.label, lcd_color565(210, 210, 210));
-    }
-
-    draw_text_tiny(8, 116, "EXPECTED: RED GREEN BLUE YELLOW CYAN MAGENTA WHITE BLACK", lcd_color565(180, 180, 180));
-    return ESP_OK;
 }
 
 void dump_framebuffer_to_serial(void)

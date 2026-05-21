@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <map>
 #include <sstream>
+#include <utility>
 
 namespace lofi {
 namespace {
@@ -210,25 +211,103 @@ void shuffle_indices(std::vector<size_t> &items, uint32_t seed)
     }
 }
 
-std::vector<size_t> path_sorted_track_indices(const LibraryIndex &index)
+std::string folder_id_for_track(const std::string &path)
 {
-    std::vector<size_t> items;
-    for (size_t i = 0; i < index.tracks.size(); ++i) {
-        items.push_back(i);
+    std::vector<std::string> parts = relative_music_parts(path);
+    if (!parts.empty()) {
+        parts.pop_back();
     }
-    std::sort(items.begin(), items.end(), [&](size_t lhs, size_t rhs) {
-        return lower_copy(index.tracks[lhs].path) < lower_copy(index.tracks[rhs].path);
-    });
-    return items;
+    if (parts.empty()) {
+        return "/Music";
+    }
+    std::string id = "/Music";
+    for (const std::string &part : parts) {
+        id += "/";
+        id += part;
+    }
+    return id;
 }
 
-std::string parent_folder_label(const std::string &path)
+std::string folder_label_from_id(const std::string &folder_id)
 {
-    const std::vector<std::string> parts = relative_music_parts(path);
+    const std::vector<std::string> parts = split_path(folder_id);
     if (parts.size() >= 2) {
-        return parts[parts.size() - 2];
+        return parts.back();
     }
     return "Music";
+}
+
+void sort_folder_tracks(LibraryIndex &index)
+{
+    for (Folder &folder : index.folders) {
+        std::sort(folder.track_indices.begin(), folder.track_indices.end(), [&](size_t lhs, size_t rhs) {
+            return lower_copy(index.tracks[lhs].path) < lower_copy(index.tracks[rhs].path);
+        });
+    }
+}
+
+std::vector<size_t> recently_added_track_indices(const LibraryIndex &index)
+{
+    std::vector<size_t> tracks;
+    for (size_t i = 0; i < index.tracks.size(); ++i) {
+        tracks.push_back(i);
+    }
+    std::sort(tracks.begin(), tracks.end(), [&](size_t lhs, size_t rhs) {
+        const Track &a = index.tracks[lhs];
+        const Track &b = index.tracks[rhs];
+        if (a.mtime != b.mtime) {
+            return a.mtime > b.mtime;
+        }
+        return lower_copy(a.path) < lower_copy(b.path);
+    });
+    return tracks;
+}
+
+void build_virtual_playlists(LibraryIndex &index)
+{
+    index.playlists.clear();
+    if (index.tracks.empty()) {
+        return;
+    }
+
+    Playlist all;
+    all.id = "virtual:all";
+    all.title = "All Songs";
+    for (size_t i = 0; i < index.tracks.size(); ++i) {
+        all.track_indices.push_back(i);
+    }
+    index.playlists.push_back(all);
+
+    Playlist recent;
+    recent.id = "virtual:recent";
+    recent.title = "Recently Added";
+    recent.track_indices = recently_added_track_indices(index);
+    index.playlists.push_back(recent);
+
+    Playlist loose;
+    loose.id = "virtual:loose";
+    loose.title = "Loose Tracks";
+    for (size_t i = 0; i < index.tracks.size(); ++i) {
+        const Track &track = index.tracks[i];
+        if (track.album == "Singles / Loose" || track.album == "Inbox") {
+            loose.track_indices.push_back(i);
+        }
+    }
+    if (!loose.track_indices.empty()) {
+        index.playlists.push_back(loose);
+    }
+
+    Playlist compilations;
+    compilations.id = "virtual:compilations";
+    compilations.title = "Compilations";
+    for (size_t i = 0; i < index.tracks.size(); ++i) {
+        if (index.tracks[i].album_artist == "Various Artists") {
+            compilations.track_indices.push_back(i);
+        }
+    }
+    if (!compilations.track_indices.empty()) {
+        index.playlists.push_back(compilations);
+    }
 }
 
 size_t next_utf8_offset(const std::string &value, size_t offset)
@@ -403,6 +482,97 @@ constexpr LofiPreset kLofiPresetChoices[] = {
 };
 
 constexpr size_t kLofiPresetChoiceCount = sizeof(kLofiPresetChoices) / sizeof(kLofiPresetChoices[0]);
+constexpr int kScreenOffChoices[] = {10, 15, 20, 30, 60, 120, 180, 300, 600, 0};
+constexpr size_t kScreenOffChoiceCount = sizeof(kScreenOffChoices) / sizeof(kScreenOffChoices[0]);
+constexpr size_t kLibraryRootVisibleRows = 5;
+constexpr size_t kLibraryListVisibleRows = 4;
+constexpr int kVolumeBoostThreshold = 80;
+
+int normalize_user_volume_percent(int percent)
+{
+    return std::max(0, std::min(100, percent));
+}
+
+bool adjust_user_volume(PlaybackState &playback, UiState &ui, int delta)
+{
+    const int current = normalize_user_volume_percent(playback.volume);
+    if (delta > 0 && current == kVolumeBoostThreshold && !ui.volume_boost_warning_armed) {
+        ui.volume_boost_warning_armed = true;
+        ui.toast = "Distortion risk. Press again";
+        return false;
+    }
+
+    const int next = normalize_user_volume_percent(current + delta);
+    playback.volume = next;
+    if (next <= kVolumeBoostThreshold || delta < 0) {
+        ui.volume_boost_warning_armed = false;
+    }
+    ui.toast = "Volume " + std::to_string(playback.volume);
+    return next != current;
+}
+
+int normalize_brightness_percent(int percent)
+{
+    percent = std::max(10, std::min(100, percent));
+    return ((percent + 5) / 10) * 10;
+}
+
+int step_brightness_percent(int percent, int delta)
+{
+    percent = normalize_brightness_percent(percent);
+    if (delta < 0) {
+        return std::max(10, percent - 10);
+    }
+    if (delta > 0) {
+        return std::min(100, percent + 10);
+    }
+    return percent;
+}
+
+int nearest_screen_off_choice_index(int seconds)
+{
+    if (seconds <= 0) {
+        return static_cast<int>(kScreenOffChoiceCount) - 1;
+    }
+    int best_index = 0;
+    int best_delta = std::abs(seconds - kScreenOffChoices[0]);
+    for (size_t i = 1; i < kScreenOffChoiceCount; ++i) {
+        const int delta = std::abs(seconds - kScreenOffChoices[i]);
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_index = static_cast<int>(i);
+        }
+    }
+    return best_index;
+}
+
+int normalize_screen_off_seconds(int seconds)
+{
+    return kScreenOffChoices[nearest_screen_off_choice_index(seconds)];
+}
+
+int step_screen_off_seconds(int seconds, int delta)
+{
+    int index = nearest_screen_off_choice_index(seconds);
+    if (delta < 0) {
+        index = index == 0 ? static_cast<int>(kScreenOffChoiceCount) - 1 : index - 1;
+    } else if (delta > 0) {
+        index = index + 1 >= static_cast<int>(kScreenOffChoiceCount) ? 0 : index + 1;
+    }
+    return kScreenOffChoices[index];
+}
+
+std::string format_screen_off_seconds(int seconds)
+{
+    seconds = normalize_screen_off_seconds(seconds);
+    if (seconds <= 0) {
+        return "Forever";
+    }
+    if (seconds < 60) {
+        return std::to_string(seconds) + "s";
+    }
+    return std::to_string(seconds / 60) + "m";
+}
 
 void clamp_selection(UiState &ui, size_t count)
 {
@@ -420,6 +590,214 @@ void clamp_selection(UiState &ui, size_t count)
     if (ui.selected >= ui.scroll + 4) {
         ui.scroll = ui.selected - 3;
     }
+}
+
+void clamp_selection_window(UiState &ui, size_t count, size_t visible_rows)
+{
+    if (count == 0) {
+        ui.selected = 0;
+        ui.scroll = 0;
+        return;
+    }
+    if (ui.selected >= count) {
+        ui.selected = count - 1;
+    }
+    const size_t visible = std::max<size_t>(1, visible_rows);
+    if (ui.selected < ui.scroll) {
+        ui.scroll = ui.selected;
+    }
+    if (ui.selected >= ui.scroll + visible) {
+        ui.scroll = ui.selected - visible + 1;
+    }
+    if (count <= visible) {
+        ui.scroll = 0;
+    } else {
+        ui.scroll = std::min(ui.scroll, count - visible);
+    }
+}
+
+size_t list_window_start(size_t scroll, size_t selected, size_t count, size_t visible_rows)
+{
+    if (count == 0) {
+        return 0;
+    }
+    const size_t visible = std::max<size_t>(1, visible_rows);
+    if (count <= visible) {
+        return 0;
+    }
+    const size_t max_start = count - visible;
+    const size_t safe_selected = std::min(selected, count - 1);
+    size_t start = std::min(scroll, max_start);
+    if (safe_selected < start) {
+        start = safe_selected;
+    } else if (safe_selected >= start + visible) {
+        start = safe_selected - visible + 1;
+    }
+    return std::min(start, max_start);
+}
+
+void move_selection_wrapped(UiState &ui, size_t count, int delta, size_t visible_rows)
+{
+    if (count == 0) {
+        ui.selected = 0;
+        ui.scroll = 0;
+        return;
+    }
+    const size_t current = std::min(ui.selected, count - 1);
+    if (delta < 0) {
+        ui.selected = current == 0 ? count - 1 : current - 1;
+    } else if (delta > 0) {
+        ui.selected = current + 1 >= count ? 0 : current + 1;
+    }
+    clamp_selection_window(ui, count, visible_rows);
+}
+
+bool has_track(const std::vector<size_t> &tracks, size_t track_index)
+{
+    return std::find(tracks.begin(), tracks.end(), track_index) != tracks.end();
+}
+
+void toggle_track(std::vector<size_t> &tracks, size_t track_index)
+{
+    const auto it = std::find(tracks.begin(), tracks.end(), track_index);
+    if (it == tracks.end()) {
+        tracks.push_back(track_index);
+    } else {
+        tracks.erase(it);
+    }
+}
+
+std::string count3(size_t value)
+{
+    std::ostringstream out;
+    out << std::setw(3) << std::setfill('0') << value;
+    return out.str();
+}
+
+std::vector<size_t> artist_track_indices(const LibraryIndex &index, const Artist &artist)
+{
+    std::vector<size_t> tracks;
+    for (size_t album_index : artist.album_indices) {
+        if (album_index >= index.albums.size()) {
+            continue;
+        }
+        const Album &album = index.albums[album_index];
+        tracks.insert(tracks.end(), album.track_indices.begin(), album.track_indices.end());
+    }
+    return tracks;
+}
+
+Queue make_explicit_queue(std::vector<size_t> tracks, const std::string &source_id, bool shuffle, uint32_t seed)
+{
+    Queue queue;
+    queue.source_type = "selection";
+    queue.source_id = source_id;
+    queue.track_indices = std::move(tracks);
+    queue.current_index = 0;
+    queue.shuffle = shuffle;
+    queue.shuffle_seed = seed;
+    if (queue.shuffle) {
+        shuffle_indices(queue.track_indices, queue.shuffle_seed);
+    }
+    return queue;
+}
+
+UiNavEntry capture_nav_entry(const UiState &ui)
+{
+    UiNavEntry entry;
+    entry.page = ui.page;
+    entry.context_index = ui.context_index;
+    entry.parent_index = ui.parent_index;
+    entry.selected = ui.selected;
+    entry.scroll = ui.scroll;
+    return entry;
+}
+
+void restore_nav_entry(UiState &ui, const UiNavEntry &entry)
+{
+    ui.page = entry.page;
+    ui.context_index = entry.context_index;
+    ui.parent_index = entry.parent_index;
+    ui.selected = entry.selected;
+    ui.scroll = entry.scroll;
+}
+
+void push_nav_entry(UiState &ui)
+{
+    constexpr size_t kMaxNavDepth = 16;
+    if (!ui.back_stack.empty()) {
+        const UiNavEntry &last = ui.back_stack.back();
+        if (last.page == ui.page && last.context_index == ui.context_index && last.parent_index == ui.parent_index &&
+            last.selected == ui.selected && last.scroll == ui.scroll) {
+            return;
+        }
+    }
+    if (ui.back_stack.size() >= kMaxNavDepth) {
+        ui.back_stack.erase(ui.back_stack.begin());
+    }
+    ui.back_stack.push_back(capture_nav_entry(ui));
+}
+
+void reset_page_position(UiState &ui)
+{
+    ui.selected = 0;
+    ui.scroll = 0;
+    ui.context_index = 0;
+    ui.parent_index = 0;
+}
+
+void navigate_to(UiState &ui, Page page, bool reset_position = true)
+{
+    if (ui.page != page) {
+        push_nav_entry(ui);
+    }
+    ui.previous_page = ui.page;
+    ui.page = page;
+    if (reset_position) {
+        reset_page_position(ui);
+    }
+}
+
+void navigate_back(UiState &ui, Page fallback, size_t fallback_selected = 0)
+{
+    if (!ui.back_stack.empty()) {
+        const UiNavEntry entry = ui.back_stack.back();
+        ui.back_stack.pop_back();
+        restore_nav_entry(ui, entry);
+        return;
+    }
+    ui.page = fallback;
+    ui.selected = fallback_selected;
+    ui.scroll = 0;
+}
+
+void reset_to_home(UiState &ui)
+{
+    ui.page = Page::LibraryHome;
+    ui.previous_page = Page::LibraryHome;
+    ui.action_return_page = Page::LibraryRoot;
+    ui.context_index = 0;
+    ui.parent_index = 0;
+    ui.selected = 0;
+    ui.scroll = 0;
+    ui.selected_tracks.clear();
+    ui.action_tracks.clear();
+    ui.action_label.clear();
+    ui.back_stack.clear();
+}
+
+void begin_library_action(UiState &ui,
+                          std::vector<size_t> tracks,
+                          const std::string &label,
+                          Page return_page)
+{
+    ui.previous_page = ui.page;
+    ui.action_return_page = return_page;
+    ui.action_tracks = std::move(tracks);
+    ui.action_label = label;
+    navigate_to(ui, Page::LibraryAction);
+    ui.selected = 0;
+    ui.scroll = 0;
 }
 
 } // namespace
@@ -486,6 +864,7 @@ LibraryIndex build_library_index(const std::vector<std::string> &paths)
     LibraryIndex index;
     std::map<std::string, size_t> album_by_id;
     std::map<std::string, size_t> artist_by_name;
+    std::map<std::string, size_t> folder_by_id;
 
     for (const std::string &path : paths) {
         const std::vector<std::string> rel = relative_music_parts(path);
@@ -498,6 +877,20 @@ LibraryIndex build_library_index(const std::vector<std::string> &paths)
         Track track = infer_track_from_path(path);
         const size_t track_index = index.tracks.size();
         index.tracks.push_back(track);
+
+        const std::string folder_id = folder_id_for_track(path);
+        auto folder_it = folder_by_id.find(folder_id);
+        if (folder_it == folder_by_id.end()) {
+            Folder folder;
+            folder.id = folder_id;
+            folder.label = folder_label_from_id(folder_id);
+            folder.path = folder_id;
+            folder.track_indices.push_back(track_index);
+            folder_by_id[folder.id] = index.folders.size();
+            index.folders.push_back(folder);
+        } else {
+            index.folders[folder_it->second].track_indices.push_back(track_index);
+        }
 
         const std::string album_id = make_id("album", track.album_artist, track.album);
         auto album_it = album_by_id.find(album_id);
@@ -527,6 +920,7 @@ LibraryIndex build_library_index(const std::vector<std::string> &paths)
     }
 
     sort_album_tracks(index);
+    sort_folder_tracks(index);
 
     std::sort(index.albums.begin(), index.albums.end(), [](const Album &a, const Album &b) {
         if (lower_copy(a.album_artist) != lower_copy(b.album_artist)) {
@@ -557,6 +951,12 @@ LibraryIndex build_library_index(const std::vector<std::string> &paths)
     std::sort(index.artists.begin(), index.artists.end(), [](const Artist &a, const Artist &b) {
         return lower_copy(a.name) < lower_copy(b.name);
     });
+
+    std::sort(index.folders.begin(), index.folders.end(), [](const Folder &a, const Folder &b) {
+        return lower_copy(a.path) < lower_copy(b.path);
+    });
+
+    build_virtual_playlists(index);
 
     if (index.tracks.empty()) {
         index.warnings.push_back("No playable files found under /Music");
@@ -627,28 +1027,54 @@ Queue make_all_tracks_queue(const LibraryIndex &index, bool shuffle, uint32_t se
 
 Queue make_folder_queue(const LibraryIndex &index, size_t selected_order_index, bool shuffle, uint32_t seed)
 {
-    Queue queue;
-    queue.source_type = "folder";
-    queue.source_id = "/Music";
-    queue.shuffle = shuffle;
-    queue.shuffle_seed = seed;
-    queue.track_indices = path_sorted_track_indices(index);
-    if (queue.track_indices.empty()) {
-        queue.current_index = 0;
+    if (index.folders.empty()) {
+        Queue queue;
+        queue.source_type = "folder";
+        queue.source_id = "/Music";
+        queue.shuffle = shuffle;
+        queue.shuffle_seed = seed;
         return queue;
     }
-    if (selected_order_index >= queue.track_indices.size()) {
-        selected_order_index = queue.track_indices.size() - 1;
+    if (selected_order_index >= index.folders.size()) {
+        selected_order_index = index.folders.size() - 1;
     }
-    const size_t selected_track = queue.track_indices[selected_order_index];
+    return make_folder_queue(index, index.folders[selected_order_index].id, shuffle, seed);
+}
+
+Queue make_folder_queue(const LibraryIndex &index, const std::string &folder_id, bool shuffle, uint32_t seed)
+{
+    Queue queue;
+    queue.source_type = "folder";
+    queue.source_id = folder_id.empty() ? "/Music" : folder_id;
+    queue.shuffle = shuffle;
+    queue.shuffle_seed = seed;
+    for (const Folder &folder : index.folders) {
+        if (folder.id == queue.source_id) {
+            queue.track_indices = folder.track_indices;
+            break;
+        }
+    }
     if (shuffle) {
         shuffle_indices(queue.track_indices, seed);
-        const auto selected_it = std::find(queue.track_indices.begin(), queue.track_indices.end(), selected_track);
-        queue.current_index = selected_it == queue.track_indices.end()
-                                  ? 0
-                                  : static_cast<size_t>(selected_it - queue.track_indices.begin());
-    } else {
-        queue.current_index = selected_order_index;
+    }
+    return queue;
+}
+
+Queue make_playlist_queue(const LibraryIndex &index, const std::string &playlist_id, bool shuffle, uint32_t seed)
+{
+    Queue queue;
+    queue.source_type = "playlist";
+    queue.source_id = playlist_id;
+    queue.shuffle = shuffle;
+    queue.shuffle_seed = seed;
+    for (const Playlist &playlist : index.playlists) {
+        if (playlist.id == playlist_id) {
+            queue.track_indices = playlist.track_indices;
+            break;
+        }
+    }
+    if (shuffle) {
+        shuffle_indices(queue.track_indices, seed);
     }
     return queue;
 }
@@ -794,6 +1220,10 @@ const char *to_string(Page page)
         return "Now Playing";
     case Page::LibraryHome:
         return "Library";
+    case Page::LibraryRoot:
+        return "Library Root";
+    case Page::Songs:
+        return "Songs";
     case Page::Albums:
         return "Albums";
     case Page::Artists:
@@ -802,8 +1232,16 @@ const char *to_string(Page page)
         return "Artist";
     case Page::AlbumDetail:
         return "Album";
+    case Page::LibraryAction:
+        return "Library Action";
     case Page::Folder:
+        return "Folders";
+    case Page::FolderDetail:
         return "Folder";
+    case Page::Playlists:
+        return "Playlists";
+    case Page::PlaylistDetail:
+        return "Playlist";
     case Page::LofiPresets:
         return "Lo-Fi";
     case Page::LofiEdit:
@@ -859,12 +1297,23 @@ RepeatMode repeat_from_string(const std::string &value)
     return RepeatMode::Off;
 }
 
+int audio_volume_from_user_percent(int volume)
+{
+    volume = std::max(0, std::min(100, volume));
+    if (volume <= kVolumeBoostThreshold) {
+        return 50 + (volume * 20 + 40) / 80;
+    }
+    return 70 + ((volume - kVolumeBoostThreshold) * 10 + 10) / 20;
+}
+
 std::string serialize_playback_state(const PlaybackState &state)
 {
     std::ostringstream out;
     out << "current_track=" << state.current_track << "\n";
     out << "position_seconds=" << state.position_seconds << "\n";
-    out << "volume=" << state.volume << "\n";
+    out << "volume=" << normalize_user_volume_percent(state.volume) << "\n";
+    out << "brightness_percent=" << normalize_brightness_percent(state.brightness_percent) << "\n";
+    out << "screen_off_seconds=" << normalize_screen_off_seconds(state.screen_off_seconds) << "\n";
     out << "repeat=" << to_string(state.repeat) << "\n";
     out << "playing=" << (state.playing ? 1 : 0) << "\n";
     out << "queue_source_type=" << state.queue.source_type << "\n";
@@ -898,7 +1347,11 @@ bool parse_playback_state(const std::string &text, PlaybackState &out)
         } else if (key == "position_seconds") {
             out.position_seconds = parse_int_or(value, out.position_seconds);
         } else if (key == "volume") {
-            out.volume = std::max(0, std::min(100, parse_int_or(value, out.volume)));
+            out.volume = normalize_user_volume_percent(parse_int_or(value, out.volume));
+        } else if (key == "brightness_percent") {
+            out.brightness_percent = normalize_brightness_percent(parse_int_or(value, out.brightness_percent));
+        } else if (key == "screen_off_seconds") {
+            out.screen_off_seconds = normalize_screen_off_seconds(parse_int_or(value, out.screen_off_seconds));
         } else if (key == "repeat") {
             out.repeat = repeat_from_string(value);
         } else if (key == "playing") {
@@ -929,6 +1382,11 @@ bool parse_playback_state(const std::string &text, PlaybackState &out)
             out.lofi.softness = parse_int_or(value, out.lofi.softness);
         }
     }
+    if (out.lofi.preset != LofiPreset::Off && out.lofi.preset != LofiPreset::Custom) {
+        out.lofi = lofi_preset(out.lofi.preset);
+    }
+    out.brightness_percent = normalize_brightness_percent(out.brightness_percent);
+    out.screen_off_seconds = normalize_screen_off_seconds(out.screen_off_seconds);
     return true;
 }
 
@@ -942,7 +1400,9 @@ bool restore_playback_queue(const LibraryIndex &index, PlaybackState &state, boo
     } else if (state.queue.source_type == "library") {
         restored = make_all_tracks_queue(index, state.queue.shuffle, state.queue.shuffle_seed);
     } else if (state.queue.source_type == "folder") {
-        restored = make_folder_queue(index, 0, state.queue.shuffle, state.queue.shuffle_seed);
+        restored = make_folder_queue(index, state.queue.source_id, state.queue.shuffle, state.queue.shuffle_seed);
+    } else if (state.queue.source_type == "playlist") {
+        restored = make_playlist_queue(index, state.queue.source_id, state.queue.shuffle, state.queue.shuffle_seed);
     } else {
         state.current_track = -1;
         state.playing = false;
@@ -970,12 +1430,169 @@ bool restore_playback_queue(const LibraryIndex &index, PlaybackState &state, boo
     return state.current_track >= 0;
 }
 
+PlaybackRestoreResult restore_saved_playback_state(const LibraryIndex &index,
+                                                   const PlaybackState &saved,
+                                                   PlaybackState &state,
+                                                   bool resume_playing)
+{
+    PlaybackRestoreResult result;
+
+    PlaybackState restored = state;
+    restored.volume = normalize_user_volume_percent(saved.volume);
+    restored.brightness_percent = normalize_brightness_percent(saved.brightness_percent);
+    restored.screen_off_seconds = normalize_screen_off_seconds(saved.screen_off_seconds);
+    restored.repeat = saved.repeat;
+    restored.lofi = saved.lofi;
+    restored.queue.shuffle = saved.queue.shuffle;
+    restored.queue.shuffle_seed = saved.queue.shuffle_seed;
+    result.settings_restored = true;
+
+    PlaybackState queue_candidate = saved;
+    if (restore_playback_queue(index, queue_candidate, resume_playing)) {
+        queue_candidate.volume = restored.volume;
+        queue_candidate.brightness_percent = restored.brightness_percent;
+        queue_candidate.screen_off_seconds = restored.screen_off_seconds;
+        queue_candidate.repeat = restored.repeat;
+        queue_candidate.lofi = restored.lofi;
+        restored = queue_candidate;
+        result.queue_restored = true;
+    }
+
+    state = restored;
+    return result;
+}
+
+std::string serialize_queue_snapshot(const LibraryIndex &index, const PlaybackState &state)
+{
+    std::vector<std::string> paths;
+    paths.reserve(state.queue.track_indices.size());
+    for (size_t track_index : state.queue.track_indices) {
+        if (track_index < index.tracks.size()) {
+            paths.push_back(index.tracks[track_index].path);
+        }
+    }
+
+    std::ostringstream out;
+    out << "version=1\n";
+    out << "source_type=" << state.queue.source_type << "\n";
+    out << "source_id=" << state.queue.source_id << "\n";
+    out << "queue_index=" << state.queue.current_index << "\n";
+    out << "shuffle=" << (state.queue.shuffle ? 1 : 0) << "\n";
+    out << "shuffle_seed=" << state.queue.shuffle_seed << "\n";
+    if (state.queue.current_index < state.queue.track_indices.size()) {
+        const size_t current_track = state.queue.track_indices[state.queue.current_index];
+        if (current_track < index.tracks.size()) {
+            out << "current_path=" << index.tracks[current_track].path << "\n";
+        }
+    }
+    out << "track_count=" << paths.size() << "\n";
+    for (const std::string &path : paths) {
+        out << "track=" << path << "\n";
+    }
+    return out.str();
+}
+
+QueueSnapshotRestoreResult restore_queue_snapshot(const LibraryIndex &index,
+                                                  const std::string &text,
+                                                  PlaybackState &state,
+                                                  bool resume_playing)
+{
+    Queue restored;
+    restored.source_type = "selection";
+    restored.source_id = "QUEUE";
+    std::string current_path;
+    std::vector<std::string> paths;
+
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, eq);
+        const std::string value = line.substr(eq + 1);
+        if (key == "source_type") {
+            restored.source_type = value.empty() ? "selection" : value;
+        } else if (key == "source_id") {
+            restored.source_id = value.empty() ? "QUEUE" : value;
+        } else if (key == "queue_index") {
+            restored.current_index = static_cast<size_t>(std::max(0, parse_int_or(value, static_cast<int>(restored.current_index))));
+        } else if (key == "shuffle") {
+            restored.shuffle = value == "1";
+        } else if (key == "shuffle_seed") {
+            restored.shuffle_seed = parse_u32_or(value, restored.shuffle_seed);
+        } else if (key == "current_path") {
+            current_path = value;
+        } else if (key == "track") {
+            paths.push_back(value);
+        }
+    }
+
+    QueueSnapshotRestoreResult result;
+    result.saved_count = paths.size();
+    if (paths.empty()) {
+        state.queue = restored;
+        state.current_track = -1;
+        state.playing = false;
+        return result;
+    }
+
+    std::map<std::string, size_t> path_to_track;
+    for (size_t i = 0; i < index.tracks.size(); ++i) {
+        path_to_track[index.tracks[i].path] = i;
+    }
+
+    size_t restored_current_index = restored.current_index;
+    bool found_current_path = false;
+    for (const std::string &path : paths) {
+        const auto it = path_to_track.find(path);
+        if (it == path_to_track.end()) {
+            ++result.missing_count;
+            continue;
+        }
+        if (!current_path.empty() && path == current_path) {
+            restored_current_index = restored.track_indices.size();
+            found_current_path = true;
+        }
+        restored.track_indices.push_back(it->second);
+    }
+
+    result.restored_count = restored.track_indices.size();
+    if (restored.track_indices.empty()) {
+        state.queue = restored;
+        state.current_track = -1;
+        state.playing = false;
+        return result;
+    }
+
+    if (found_current_path) {
+        restored.current_index = restored_current_index;
+        result.current_restored = true;
+    } else if (restored.current_index >= restored.track_indices.size()) {
+        restored.current_index = restored.track_indices.size() - 1;
+    }
+
+    state.queue = restored;
+    state.current_track = queue_current_track(state.queue);
+    state.playing = resume_playing && state.current_track >= 0;
+    if (!result.current_restored && !current_path.empty()) {
+        state.position_seconds = 0;
+    }
+    result.restored = state.current_track >= 0;
+    return result;
+}
+
 ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playback, const UiState &ui)
 {
     ScreenModel screen;
     screen.title = to_string(ui.page);
     screen.status = std::string("SD ") + (index.tracks.empty() ? "EMPTY" : "OK") + " | Vol " +
                     std::to_string(playback.volume) + " | LF " + to_string(playback.lofi.preset);
+    if (ui.page == Page::LofiPresets || ui.page == Page::LofiEdit) {
+        screen.meta = "Intensity " + std::to_string((std::max(0, std::min(100, playback.lofi.intensity)) + 5) / 10) +
+                      "/10";
+    }
     screen.soft_left = "Back";
     screen.soft_center = "OK";
     screen.soft_right = "Menu";
@@ -998,47 +1615,133 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
             screen.rows.push_back({"Open Library to play", ""});
         }
     } else if (ui.page == Page::LibraryHome) {
-        screen.soft_center = ui.selected == 3 ? "Shuffle" : (ui.selected == 6 ? "Scan" : "Open");
-        screen.soft_right = "Scan";
-        static const char *items[] = {"Now Playing", "Albums", "Artists", "Shuffle All", "Folder", "Lo-Fi", "Scan"};
-        for (size_t i = ui.scroll; i < 7 && screen.rows.size() < 4; ++i) {
+        screen.soft_center = "Open";
+        screen.soft_right = "Menu";
+        static const char *items[] = {"Library", "Queue", "Lo-Fi", "Settings", "Now Playing"};
+        const size_t selected = ui.selected < 5 ? ui.selected : 0;
+        for (size_t i = 0; i < kLibraryRootVisibleRows; ++i) {
             std::string right;
-            if (i == 0 && playback.current_track >= 0) {
-                right = "NOW";
-            } else if (i == 1) {
+            if (i == 0) {
                 right = std::to_string(index.albums.size());
+            } else if (i == 1) {
+                right = playback.queue.track_indices.empty() ? "0" : std::to_string(playback.queue.track_indices.size());
             } else if (i == 2) {
-                right = std::to_string(index.artists.size());
-            } else if (i == 3) {
-                right = "ALL";
-            } else if (i == 4) {
-                right = "SD";
-            } else if (i == 5) {
                 right = first_n(to_string(playback.lofi.preset), 6);
+            } else if (i == 3) {
+                right = "MENU";
+            } else if (i == 4 && playback.current_track >= 0) {
+                right = "NOW";
             }
-            screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + items[i], right});
+            screen.rows.push_back({std::string(i == selected ? "> " : "  ") + items[i], right});
         }
+    } else if (ui.page == Page::LibraryRoot) {
+        screen.title = "Library Root";
+        screen.subtitle = "ALL LIBRARY";
+        screen.meta = std::to_string(index.tracks.size()) + " SONGS";
+        screen.soft_left = "Back";
+        screen.soft_center = "Open";
+        screen.soft_right = "Menu";
+        struct LibraryRootItem {
+            const char *label;
+            std::string right;
+        };
+        const LibraryRootItem items[] = {
+            {"SONGS", count3(index.tracks.size())},
+            {"ARTISTS", count3(index.artists.size())},
+            {"ALBUMS", count3(index.albums.size())},
+            {"FOLDERS", count3(index.folders.size())},
+            {"PLAYLISTS", count3(index.playlists.size())},
+        };
+        const size_t selected = std::min<size_t>(ui.selected, 4);
+        for (size_t i = 0; i < kLibraryRootVisibleRows; ++i) {
+            screen.rows.push_back({std::string(i == selected ? "> " : "  ") + items[i].label, items[i].right});
+        }
+        screen.status = "range=001-005/005";
+    } else if (ui.page == Page::Songs) {
+        screen.title = "Songs";
+        screen.subtitle = "ALL LIBRARY";
+        screen.meta = std::to_string(index.tracks.size()) + " SONGS";
+        screen.soft_left = "Back";
+        screen.soft_center = "Open";
+        screen.soft_right = ui.selected == 0 ? "Menu" : "Select";
+        const size_t total_rows = index.tracks.size() + 1;
+        const size_t selected = total_rows == 0 ? 0 : std::min(ui.selected, total_rows - 1);
+        const size_t visible = kLibraryListVisibleRows;
+        const size_t start = list_window_start(ui.scroll, selected, total_rows, visible);
+        const size_t end = std::min(total_rows, start + visible);
+        for (size_t row_index = start; row_index < end; ++row_index) {
+            if (row_index == 0) {
+                screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + "PLAY ALL",
+                                       count3(index.tracks.size())});
+                continue;
+            }
+            const size_t track_index = row_index - 1;
+            if (track_index >= index.tracks.size()) {
+                continue;
+            }
+            const Track &track = index.tracks[track_index];
+            const bool checked = has_track(ui.selected_tracks, track_index);
+            screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + (checked ? "[x] " : "[ ] ") +
+                                       first_n(track.title, 28),
+                                   track.duration_seconds > 0 ? std::to_string(track.duration_seconds) : ""});
+        }
+        screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(total_rows) +
+                        " selected=" + std::to_string(ui.selected_tracks.size());
     } else if (ui.page == Page::Albums || ui.page == Page::AlbumDetail) {
+        screen.soft_center = "Open";
+        screen.soft_right = "Menu";
         if (index.albums.empty()) {
+            screen.subtitle = "ALBUMS";
+            screen.meta = "000 ALBUMS";
             screen.rows.push_back({"No albums", "Scan"});
         } else if (ui.page == Page::Albums) {
-            for (size_t i = ui.scroll; i < index.albums.size() && screen.rows.size() < 4; ++i) {
+            screen.subtitle = "ALBUMS";
+            screen.meta = std::to_string(index.albums.size()) + " ALBUMS";
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t selected = std::min(ui.selected, index.albums.size() - 1);
+            const size_t start = list_window_start(ui.scroll, selected, index.albums.size(), visible);
+            const size_t end = std::min(index.albums.size(), start + visible);
+            for (size_t i = start; i < end; ++i) {
                 const Album &album = index.albums[i];
-                screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + first_n(album.title, 18),
-                                       std::to_string(album.track_indices.size())});
+                screen.rows.push_back({std::string(i == selected ? "> " : "  ") + first_n(album.title, 24),
+                                       count3(album.track_indices.size())});
             }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(index.albums.size());
         } else {
             const Album &album = index.albums[std::min(ui.context_index, index.albums.size() - 1)];
             screen.soft_left = "Back";
-            screen.soft_center = "Play";
-            screen.soft_right = "Album";
-            screen.rows.push_back({first_n(album.title, 22), std::to_string(album.track_indices.size())});
-            for (size_t i = ui.scroll; i < album.track_indices.size() && screen.rows.size() < 4; ++i) {
-                const Track &track = index.tracks[album.track_indices[i]];
-                screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + std::to_string(i + 1) + ". " +
-                                           first_n(track.title, 16),
-                                       ""});
+            screen.soft_center = "Open";
+            screen.soft_right = ui.selected == 0 ? "Menu" : "Select";
+            screen.subtitle = first_n(album.title, 24);
+            screen.meta = (album.album_artist.empty() ? "UNKNOWN" : first_n(album.album_artist, 16)) + " / " +
+                          std::to_string(album.track_indices.size()) + " SONGS";
+            const size_t total_rows = album.track_indices.size() + 1;
+            const size_t selected = total_rows == 0 ? 0 : std::min(ui.selected, total_rows - 1);
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t start = list_window_start(ui.scroll, selected, total_rows, visible);
+            const size_t end = std::min(total_rows, start + visible);
+            for (size_t row_index = start; row_index < end; ++row_index) {
+                if (row_index == 0) {
+                    screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + "ALL TRACKS",
+                                           count3(album.track_indices.size())});
+                    continue;
+                }
+                const size_t album_row = row_index - 1;
+                if (album_row >= album.track_indices.size()) {
+                    continue;
+                }
+                const size_t track_index = album.track_indices[album_row];
+                if (track_index >= index.tracks.size()) {
+                    continue;
+                }
+                const Track &track = index.tracks[track_index];
+                const bool checked = has_track(ui.selected_tracks, track_index);
+                screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + (checked ? "[x] " : "[ ] ") +
+                                           count3(album_row + 1) + " " + first_n(track.title, 22),
+                                       track.duration_seconds > 0 ? std::to_string(track.duration_seconds) : ""});
             }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(total_rows) +
+                            " selected=" + std::to_string(ui.selected_tracks.size());
         }
     } else if (ui.page == Page::Artists) {
         screen.soft_center = "Open";
@@ -1046,53 +1749,192 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
         if (index.artists.empty()) {
             screen.rows.push_back({"No artists", "Scan"});
         } else {
-            for (size_t i = ui.scroll; i < index.artists.size() && screen.rows.size() < 4; ++i) {
+            screen.subtitle = "ALL ARTISTS";
+            screen.meta = std::to_string(index.artists.size()) + " ARTISTS";
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t selected = std::min(ui.selected, index.artists.size() - 1);
+            const size_t start = list_window_start(ui.scroll, selected, index.artists.size(), visible);
+            const size_t end = std::min(index.artists.size(), start + visible);
+            for (size_t i = start; i < end; ++i) {
                 const Artist &artist = index.artists[i];
-                screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + first_n(artist.name, 19),
-                                       std::to_string(artist.album_indices.size()) + " alb"});
+                screen.rows.push_back({std::string(i == selected ? "> " : "  ") + first_n(artist.name, 24),
+                                       count3(artist_track_indices(index, artist).size())});
             }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(index.artists.size());
         }
     } else if (ui.page == Page::ArtistAlbums) {
         screen.soft_center = "Open";
-        screen.soft_right = "Play";
+        screen.soft_right = "Menu";
         if (ui.context_index >= index.artists.size()) {
             screen.rows.push_back({"No artist", "Back"});
         } else {
             const Artist &artist = index.artists[ui.context_index];
-            screen.rows.push_back({first_n(artist.name, 22), std::to_string(artist.album_indices.size())});
-            for (size_t i = ui.scroll; i < artist.album_indices.size() && screen.rows.size() < 4; ++i) {
-                const size_t album_index = artist.album_indices[i];
+            const std::vector<size_t> artist_tracks = artist_track_indices(index, artist);
+            screen.subtitle = first_n(artist.name, 24);
+            screen.meta = std::to_string(artist_tracks.size()) + " SONGS / " +
+                          std::to_string(artist.album_indices.size()) + " ALBUMS";
+            const size_t total_rows = artist.album_indices.size() + 1;
+            const size_t selected = total_rows == 0 ? 0 : std::min(ui.selected, total_rows - 1);
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t start = list_window_start(ui.scroll, selected, total_rows, visible);
+            const size_t end = std::min(total_rows, start + visible);
+            for (size_t row_index = start; row_index < end; ++row_index) {
+                if (row_index == 0) {
+                    screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + "ALL SONGS",
+                                           count3(artist_tracks.size())});
+                    continue;
+                }
+                const size_t album_row = row_index - 1;
+                const size_t album_index = artist.album_indices[album_row];
                 if (album_index >= index.albums.size()) {
                     continue;
                 }
                 const Album &album = index.albums[album_index];
-                screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + first_n(album.title, 18),
-                                       std::to_string(album.track_indices.size())});
+                screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + first_n(album.title, 24),
+                                       count3(album.track_indices.size()) + " >"});
             }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(total_rows);
+        }
+    } else if (ui.page == Page::LibraryAction) {
+        screen.title = "Library Action";
+        screen.subtitle = std::to_string(ui.action_tracks.size()) + " TRACKS SELECTED";
+        screen.meta = ui.action_label.empty() ? "LIBRARY" : first_n(ui.action_label, 24);
+        screen.soft_left = "Back";
+        screen.soft_center = "OK";
+        screen.soft_right = "OK";
+        static const char *actions[] = {"REPLACE QUEUE", "PLAY NEXT", "ADD TO END", "ADD TO FRONT", "CANCEL"};
+        const size_t selected = std::min<size_t>(ui.selected, 4);
+        const size_t action_count = 5;
+        const size_t start = list_window_start(ui.scroll, selected, action_count, kLibraryListVisibleRows);
+        const size_t end = std::min(action_count, start + kLibraryListVisibleRows);
+        for (size_t i = start; i < end; ++i) {
+            screen.rows.push_back({std::string(i == selected ? "> " : "  ") + actions[i], ""});
         }
     } else if (ui.page == Page::Folder) {
         screen.soft_left = "Back";
-        screen.soft_center = "Play";
-        screen.soft_right = "Scan";
-        const std::vector<size_t> order = path_sorted_track_indices(index);
-        if (order.empty()) {
-            screen.rows.push_back({"No files", "Scan"});
+        screen.soft_center = "Open";
+        screen.soft_right = "Menu";
+        screen.subtitle = "FOLDERS";
+        screen.meta = std::to_string(index.folders.size()) + " FOLDERS";
+        if (index.folders.empty()) {
+            screen.rows.push_back({"No folders", "Scan"});
             screen.rows.push_back({"Put music in /Music", ""});
         } else {
-            for (size_t i = ui.scroll; i < order.size() && screen.rows.size() < 4; ++i) {
-                const Track &track = index.tracks[order[i]];
-                screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + first_n(track.title, 18),
-                                       first_n(parent_folder_label(track.path), 8)});
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t selected = std::min(ui.selected, index.folders.size() - 1);
+            const size_t start = list_window_start(ui.scroll, selected, index.folders.size(), visible);
+            const size_t end = std::min(index.folders.size(), start + visible);
+            for (size_t i = start; i < end; ++i) {
+                const Folder &folder = index.folders[i];
+                screen.rows.push_back({std::string(i == selected ? "> " : "  ") + first_n(folder.label, 24),
+                                       count3(folder.track_indices.size())});
             }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(index.folders.size());
+        }
+    } else if (ui.page == Page::FolderDetail) {
+        screen.soft_left = "Back";
+        screen.soft_center = "Open";
+        screen.soft_right = ui.selected == 0 ? "Menu" : "Select";
+        if (ui.context_index >= index.folders.size()) {
+            screen.rows.push_back({"No folder", "Back"});
+        } else {
+            const Folder &folder = index.folders[ui.context_index];
+            screen.subtitle = first_n(folder.label, 24);
+            screen.meta = std::to_string(folder.track_indices.size()) + " SONGS";
+            const size_t total_rows = folder.track_indices.size() + 1;
+            const size_t selected = total_rows == 0 ? 0 : std::min(ui.selected, total_rows - 1);
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t start = list_window_start(ui.scroll, selected, total_rows, visible);
+            const size_t end = std::min(total_rows, start + visible);
+            for (size_t row_index = start; row_index < end; ++row_index) {
+                if (row_index == 0) {
+                    screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + "ALL TRACKS",
+                                           count3(folder.track_indices.size())});
+                    continue;
+                }
+                const size_t folder_row = row_index - 1;
+                if (folder_row >= folder.track_indices.size()) {
+                    continue;
+                }
+                const size_t track_index = folder.track_indices[folder_row];
+                if (track_index >= index.tracks.size()) {
+                    continue;
+                }
+                const Track &track = index.tracks[track_index];
+                const bool checked = has_track(ui.selected_tracks, track_index);
+                screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + (checked ? "[x] " : "[ ] ") +
+                                           first_n(track.title, 26),
+                                       track.duration_seconds > 0 ? std::to_string(track.duration_seconds) : ""});
+            }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(total_rows) +
+                            " selected=" + std::to_string(ui.selected_tracks.size());
+        }
+    } else if (ui.page == Page::Playlists) {
+        screen.soft_left = "Back";
+        screen.soft_center = "Open";
+        screen.soft_right = "Menu";
+        screen.subtitle = "PLAYLISTS";
+        screen.meta = std::to_string(index.playlists.size()) + " LISTS";
+        if (index.playlists.empty()) {
+            screen.rows.push_back({"No playlists", "Scan"});
+        } else {
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t selected = std::min(ui.selected, index.playlists.size() - 1);
+            const size_t start = list_window_start(ui.scroll, selected, index.playlists.size(), visible);
+            const size_t end = std::min(index.playlists.size(), start + visible);
+            for (size_t i = start; i < end; ++i) {
+                const Playlist &playlist = index.playlists[i];
+                screen.rows.push_back({std::string(i == selected ? "> " : "  ") + first_n(playlist.title, 24),
+                                       count3(playlist.track_indices.size())});
+            }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(index.playlists.size());
+        }
+    } else if (ui.page == Page::PlaylistDetail) {
+        screen.soft_left = "Back";
+        screen.soft_center = "Open";
+        screen.soft_right = ui.selected == 0 ? "Menu" : "Select";
+        if (ui.context_index >= index.playlists.size()) {
+            screen.rows.push_back({"No playlist", "Back"});
+        } else {
+            const Playlist &playlist = index.playlists[ui.context_index];
+            screen.subtitle = first_n(playlist.title, 24);
+            screen.meta = std::to_string(playlist.track_indices.size()) + " SONGS";
+            const size_t total_rows = playlist.track_indices.size() + 1;
+            const size_t selected = total_rows == 0 ? 0 : std::min(ui.selected, total_rows - 1);
+            const size_t visible = kLibraryListVisibleRows;
+            const size_t start = list_window_start(ui.scroll, selected, total_rows, visible);
+            const size_t end = std::min(total_rows, start + visible);
+            for (size_t row_index = start; row_index < end; ++row_index) {
+                if (row_index == 0) {
+                    screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + "ALL TRACKS",
+                                           count3(playlist.track_indices.size())});
+                    continue;
+                }
+                const size_t playlist_row = row_index - 1;
+                if (playlist_row >= playlist.track_indices.size()) {
+                    continue;
+                }
+                const size_t track_index = playlist.track_indices[playlist_row];
+                if (track_index >= index.tracks.size()) {
+                    continue;
+                }
+                const Track &track = index.tracks[track_index];
+                const bool checked = has_track(ui.selected_tracks, track_index);
+                screen.rows.push_back({std::string(row_index == selected ? "> " : "  ") + (checked ? "[x] " : "[ ] ") +
+                                           first_n(track.title, 26),
+                                       track.duration_seconds > 0 ? std::to_string(track.duration_seconds) : ""});
+            }
+            screen.status = "range=" + count3(start + 1) + "-" + count3(end) + "/" + count3(total_rows) +
+                            " selected=" + std::to_string(ui.selected_tracks.size());
         }
     } else if (ui.page == Page::LofiPresets) {
         screen.soft_left = "Off";
         screen.soft_center = "Edit";
         screen.soft_right = "Apply";
-        const size_t max_rows = 3;
-        const size_t max_start = kLofiPresetChoiceCount > max_rows ? kLofiPresetChoiceCount - max_rows : 0;
-        const size_t start = std::min(ui.selected, max_start);
-        for (size_t i = start; i < kLofiPresetChoiceCount && screen.rows.size() < max_rows; ++i) {
+        constexpr size_t kVisibleRows = 4;
+        const size_t start = list_window_start(ui.scroll, std::min(ui.selected, kLofiPresetChoiceCount - 1),
+                                               kLofiPresetChoiceCount, kVisibleRows);
+        for (size_t i = start; i < kLofiPresetChoiceCount && screen.rows.size() < kVisibleRows; ++i) {
             screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + to_string(kLofiPresetChoices[i]),
                                    kLofiPresetChoices[i] == playback.lofi.preset ? "ON" : ""});
         }
@@ -1103,7 +1945,9 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
         const char *names[] = {"Intensity", "Warmth", "Noise", "Wobble", "Space", "Softness"};
         const int values[] = {playback.lofi.intensity, playback.lofi.warmth, playback.lofi.noise,
                               playback.lofi.wobble, playback.lofi.space, playback.lofi.softness};
-        for (size_t i = ui.scroll; i < 6 && screen.rows.size() < 4; ++i) {
+        constexpr size_t kVisibleRows = 5;
+        const size_t start = list_window_start(ui.scroll, std::min<size_t>(ui.selected, 5), 6, kVisibleRows);
+        for (size_t i = start; i < 6 && screen.rows.size() < kVisibleRows; ++i) {
             screen.rows.push_back({std::string(i == ui.selected ? "> " : "  ") + names[i], std::to_string(values[i])});
         }
     } else if (ui.page == Page::PlaybackMenu) {
@@ -1115,18 +1959,29 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
                                           : std::to_string(playback.queue.current_index + 1) + "/" +
                                                 std::to_string(playback.queue.track_indices.size());
         screen.rows.push_back({std::string(ui.selected == 0 ? "> " : "  ") + "Volume", std::to_string(playback.volume) + "%"});
-        screen.rows.push_back({std::string(ui.selected == 1 ? "> " : "  ") + "Repeat", to_string(playback.repeat)});
-        screen.rows.push_back({std::string(ui.selected == 2 ? "> " : "  ") + "Shuffle", playback.queue.shuffle ? "On" : "Off"});
-        screen.rows.push_back({std::string(ui.selected == 3 ? "> " : "  ") + "Queue", queue_pos});
+        screen.rows.push_back({std::string(ui.selected == 1 ? "> " : "  ") + "Brightness",
+                               std::to_string(normalize_brightness_percent(playback.brightness_percent)) + "%"});
+        screen.rows.push_back({std::string(ui.selected == 2 ? "> " : "  ") + "Repeat", to_string(playback.repeat)});
+        screen.rows.push_back({std::string(ui.selected == 3 ? "> " : "  ") + "Shuffle", playback.queue.shuffle ? "On" : "Off"});
+        screen.rows.push_back({std::string(ui.selected == 4 ? "> " : "  ") + "Queue", queue_pos});
+        screen.rows.push_back({std::string(ui.selected == 5 ? "> " : "  ") + "Screen Off",
+                               format_screen_off_seconds(playback.screen_off_seconds)});
     } else if (ui.page == Page::Queue) {
         screen.soft_left = "Back";
         screen.soft_center = "Play";
-        screen.soft_right = "Now";
+        screen.soft_right = "+6";
         if (playback.queue.track_indices.empty()) {
+            screen.status = "range=0-0/0 current=0";
             screen.rows.push_back({"Queue is empty", ""});
         } else {
-            size_t start = std::min(ui.selected, playback.queue.track_indices.size() - 1);
-            for (size_t i = start; i < playback.queue.track_indices.size() && screen.rows.size() < 3; ++i) {
+            constexpr size_t kQueuePageSize = 6;
+            const size_t total = playback.queue.track_indices.size();
+            const size_t selected = std::min(ui.selected, total - 1);
+            const size_t start = selected / kQueuePageSize * kQueuePageSize;
+            const size_t end = std::min(total, start + kQueuePageSize);
+            screen.status = "range=" + std::to_string(start + 1) + "-" + std::to_string(end) + "/" +
+                            std::to_string(total) + " current=" + std::to_string(playback.queue.current_index + 1);
+            for (size_t i = start; i < end; ++i) {
                 const size_t track_index = playback.queue.track_indices[i];
                 if (track_index >= index.tracks.size()) {
                     continue;
@@ -1134,7 +1989,7 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
                 const Track &track = index.tracks[track_index];
                 const bool is_current = i == playback.queue.current_index;
                 const std::string marker = is_current ? "*" : " ";
-                screen.rows.push_back({std::string(i == ui.selected ? ">" : " ") + marker + " " + first_n(track.title, 18),
+                screen.rows.push_back({std::string(i == selected ? ">" : " ") + marker + " " + first_n(track.title, 28),
                                        is_current ? "NOW" : std::to_string(i + 1)});
             }
         }
@@ -1164,6 +2019,12 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
     if (action == Action::None) {
         return;
     }
+    const bool volume_increase_action =
+        (ui.page == Page::NowPlaying && action == Action::Up) ||
+        (ui.page == Page::PlaybackMenu && ui.selected == 0 && (action == Action::Right || action == Action::Ok));
+    if (!volume_increase_action) {
+        ui.volume_boost_warning_armed = false;
+    }
 
     auto move_selection = [&](size_t count, int delta) {
         if (count == 0) {
@@ -1178,13 +2039,44 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
         }
         clamp_selection(ui, count);
     };
+    auto open_library_action = [&](std::vector<size_t> tracks, const std::string &label) {
+        if (tracks.empty()) {
+            ui.toast = "No tracks";
+            return;
+        }
+        begin_library_action(ui, std::move(tracks), label, ui.page);
+    };
+    auto replace_queue_and_play = [&](std::vector<size_t> tracks, const std::string &label) {
+        if (tracks.empty()) {
+            ui.toast = "No tracks";
+            return;
+        }
+        const bool shuffle = playback.queue.shuffle;
+        const uint32_t seed = shuffle ? playback.queue.shuffle_seed + 1 : playback.queue.shuffle_seed;
+        playback.queue = make_explicit_queue(std::move(tracks), label, shuffle, seed);
+        playback.current_track = queue_current_track(playback.queue);
+        playback.position_seconds = 0;
+        playback.playing = playback.current_track >= 0;
+        navigate_to(ui, Page::NowPlaying);
+    };
+    auto preferred_shuffle = [&]() {
+        return playback.queue.shuffle;
+    };
+    auto preferred_shuffle_seed = [&]() {
+        return playback.queue.shuffle ? playback.queue.shuffle_seed + 1 : playback.queue.shuffle_seed;
+    };
 
     ui.toast.clear();
+    if (action == Action::Home) {
+        reset_to_home(ui);
+        return;
+    }
+    if (action == Action::Scan) {
+        navigate_to(ui, Page::Scan);
+        return;
+    }
     if (action == Action::Lofi) {
-        ui.previous_page = ui.page;
-        ui.page = Page::LofiPresets;
-        ui.selected = 0;
-        ui.scroll = 0;
+        navigate_to(ui, Page::LofiPresets);
         return;
     }
     if (action == Action::Repeat) {
@@ -1206,8 +2098,11 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
                 playback.queue = make_artist_queue(index, playback.queue.source_id, playback.queue.shuffle,
                                                    playback.queue.shuffle_seed + 1);
             } else if (playback.queue.source_type == "folder") {
-                playback.queue = make_folder_queue(index, playback.queue.current_index, playback.queue.shuffle,
+                playback.queue = make_folder_queue(index, playback.queue.source_id, playback.queue.shuffle,
                                                    playback.queue.shuffle_seed + 1);
+            } else if (playback.queue.source_type == "playlist") {
+                playback.queue = make_playlist_queue(index, playback.queue.source_id, playback.queue.shuffle,
+                                                     playback.queue.shuffle_seed + 1);
             } else {
                 playback.queue = make_all_tracks_queue(index, playback.queue.shuffle, playback.queue.shuffle_seed + 1);
             }
@@ -1226,205 +2121,412 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
 
     switch (ui.page) {
     case Page::LibraryHome:
-        if (action == Action::Up) {
-            move_selection(7, -1);
-        } else if (action == Action::Down) {
-            move_selection(7, 1);
+        if (ui.selected >= 5) {
+            ui.selected = 0;
+        }
+        if (action == Action::Up || action == Action::Left) {
+            ui.selected = ui.selected == 0 ? 4 : ui.selected - 1;
+        } else if (action == Action::Down || action == Action::Right) {
+            ui.selected = (ui.selected + 1) % 5;
         } else if (action == Action::Menu) {
-            ui.page = Page::Scan;
-        } else if (action == Action::Ok || action == Action::Right) {
+            navigate_to(ui, Page::PlaybackMenu);
+        } else if (action == Action::Ok) {
             if (ui.selected == 0) {
-                ui.page = Page::NowPlaying;
+                navigate_to(ui, Page::LibraryRoot);
             } else if (ui.selected == 1) {
-                ui.page = Page::Albums;
-                ui.selected = 0;
+                navigate_to(ui, Page::Queue, false);
+                ui.selected = playback.queue.current_index;
                 ui.scroll = 0;
+                clamp_selection(ui, playback.queue.track_indices.size());
             } else if (ui.selected == 2) {
-                ui.page = Page::Artists;
-                ui.selected = 0;
-                ui.scroll = 0;
+                navigate_to(ui, Page::LofiPresets);
             } else if (ui.selected == 3) {
-                playback.queue = make_all_tracks_queue(index, true, 42);
-                playback.current_track = queue_current_track(playback.queue);
-                playback.playing = playback.current_track >= 0;
-                ui.page = Page::NowPlaying;
+                navigate_to(ui, Page::PlaybackMenu);
             } else if (ui.selected == 4) {
-                ui.page = Page::Folder;
-                ui.selected = 0;
-                ui.scroll = 0;
-            } else if (ui.selected == 5) {
-                ui.page = Page::LofiPresets;
-                ui.selected = 0;
-                ui.scroll = 0;
-            } else {
-                ui.page = Page::Scan;
+                navigate_to(ui, Page::NowPlaying);
             }
         }
         break;
+    case Page::LibraryRoot:
+        if (action == Action::Up) {
+            move_selection_wrapped(ui, 5, -1, kLibraryRootVisibleRows);
+        } else if (action == Action::Down) {
+            move_selection_wrapped(ui, 5, 1, kLibraryRootVisibleRows);
+        } else if (action == Action::Left || action == Action::Back) {
+            navigate_back(ui, Page::LibraryHome, 0);
+        } else if (action == Action::Ok || action == Action::Right) {
+            if (ui.selected == 0) {
+                navigate_to(ui, Page::Songs);
+                ui.selected_tracks.clear();
+            } else if (ui.selected == 1) {
+                navigate_to(ui, Page::Artists);
+            } else if (ui.selected == 2) {
+                navigate_to(ui, Page::Albums);
+            } else if (ui.selected == 3) {
+                navigate_to(ui, Page::Folder);
+            } else {
+                navigate_to(ui, Page::Playlists);
+            }
+        } else if (action == Action::Menu) {
+            open_library_action(make_all_tracks_queue(index, false, 0).track_indices, "ALL LIBRARY");
+        }
+        break;
+    case Page::Songs: {
+        const size_t total_rows = index.tracks.size() + 1;
+        if (action == Action::Up) {
+            move_selection_wrapped(ui, total_rows, -1, kLibraryListVisibleRows);
+        } else if (action == Action::Down) {
+            move_selection_wrapped(ui, total_rows, 1, kLibraryListVisibleRows);
+        } else if (action == Action::Left || action == Action::Back) {
+            navigate_back(ui, Page::LibraryRoot, 0);
+            ui.selected_tracks.clear();
+        } else if (action == Action::Shuffle && ui.selected > 0 && ui.selected - 1 < index.tracks.size()) {
+            toggle_track(ui.selected_tracks, ui.selected - 1);
+        } else if (action == Action::Menu) {
+            std::vector<size_t> tracks = ui.selected_tracks.empty()
+                                             ? make_all_tracks_queue(index, false, 0).track_indices
+                                             : ui.selected_tracks;
+            open_library_action(std::move(tracks), ui.selected_tracks.empty() ? "ALL LIBRARY" : "SELECTED SONGS");
+        } else if ((action == Action::Ok || action == Action::Right || action == Action::PlayPause)) {
+            if (ui.selected == 0) {
+                replace_queue_and_play(make_all_tracks_queue(index, false, 0).track_indices, "ALL LIBRARY");
+            } else if (ui.selected - 1 < index.tracks.size()) {
+                replace_queue_and_play(std::vector<size_t>{ui.selected - 1}, index.tracks[ui.selected - 1].title);
+            }
+        }
+        break;
+    }
     case Page::Albums:
         if (action == Action::Up) {
-            move_selection(index.albums.size(), -1);
+            move_selection_wrapped(ui, index.albums.size(), -1, 4);
         } else if (action == Action::Down) {
-            move_selection(index.albums.size(), 1);
-        } else if ((action == Action::Ok || action == Action::PlayPause) && ui.selected < index.albums.size()) {
-            playback.queue = make_album_queue(index, index.albums[ui.selected].id, false, 0);
-            playback.current_track = queue_current_track(playback.queue);
-            playback.playing = playback.current_track >= 0;
-            ui.page = Page::NowPlaying;
-        } else if (action == Action::Right && ui.selected < index.albums.size()) {
+            move_selection_wrapped(ui, index.albums.size(), 1, 4);
+        } else if ((action == Action::Ok || action == Action::Right) && ui.selected < index.albums.size()) {
             ui.previous_page = Page::Albums;
+            push_nav_entry(ui);
             ui.context_index = ui.selected;
             ui.parent_index = 0;
             ui.page = Page::AlbumDetail;
             ui.selected = 0;
             ui.scroll = 0;
+            ui.selected_tracks.clear();
+        } else if (action == Action::PlayPause && ui.selected < index.albums.size()) {
+            const Album &album = index.albums[ui.selected];
+            playback.queue = make_album_queue(index, album.id, preferred_shuffle(), preferred_shuffle_seed());
+            playback.current_track = queue_current_track(playback.queue);
+            playback.position_seconds = 0;
+            playback.playing = playback.current_track >= 0;
+            navigate_to(ui, Page::NowPlaying);
+        } else if (action == Action::Menu && ui.selected < index.albums.size()) {
+            const Album &album = index.albums[ui.selected];
+            open_library_action(album.track_indices, album.title);
         } else if (action == Action::Back || action == Action::Left) {
-            ui.page = Page::LibraryHome;
-            ui.selected = 1;
-            ui.scroll = 0;
+            navigate_back(ui, Page::LibraryRoot, 2);
         }
         break;
     case Page::AlbumDetail:
         if (action == Action::Back || action == Action::Left || ui.context_index >= index.albums.size()) {
             const size_t album_index = ui.context_index;
-            if (ui.previous_page == Page::ArtistAlbums && ui.parent_index < index.artists.size()) {
+            if (!ui.back_stack.empty()) {
+                navigate_back(ui, Page::Albums, std::min(album_index, index.albums.empty() ? 0 : index.albums.size() - 1));
+            } else if (ui.previous_page == Page::ArtistAlbums && ui.parent_index < index.artists.size()) {
                 const Artist &artist = index.artists[ui.parent_index];
                 ui.page = Page::ArtistAlbums;
                 ui.context_index = ui.parent_index;
                 ui.selected = 0;
                 for (size_t i = 0; i < artist.album_indices.size(); ++i) {
                     if (artist.album_indices[i] == album_index) {
-                        ui.selected = i;
+                        ui.selected = i + 1;
                         break;
                     }
                 }
-                clamp_selection(ui, artist.album_indices.size());
+                clamp_selection_window(ui, artist.album_indices.size() + 1, kLibraryListVisibleRows);
             } else {
                 ui.page = Page::Albums;
                 ui.selected = std::min(album_index, index.albums.empty() ? 0 : index.albums.size() - 1);
-                clamp_selection(ui, index.albums.size());
+                clamp_selection_window(ui, index.albums.size(), kLibraryListVisibleRows);
             }
+            ui.selected_tracks.clear();
         } else {
             const Album &album = index.albums[ui.context_index];
             if (action == Action::Up) {
-                move_selection(album.track_indices.size(), -1);
+                move_selection_wrapped(ui, album.track_indices.size() + 1, -1, kLibraryListVisibleRows);
             } else if (action == Action::Down) {
-                move_selection(album.track_indices.size(), 1);
-            } else if ((action == Action::Ok || action == Action::PlayPause) &&
-                       ui.selected < album.track_indices.size()) {
-                playback.queue = make_album_queue(index, album.id, false, 0);
-                if (!playback.queue.track_indices.empty()) {
-                    playback.queue.current_index = std::min(ui.selected, playback.queue.track_indices.size() - 1);
-                }
-                playback.current_track = queue_current_track(playback.queue);
-                playback.position_seconds = 0;
-                playback.playing = playback.current_track >= 0;
-                ui.page = Page::NowPlaying;
+                move_selection_wrapped(ui, album.track_indices.size() + 1, 1, kLibraryListVisibleRows);
+            } else if (action == Action::Shuffle && ui.selected > 0 && ui.selected - 1 < album.track_indices.size()) {
+                toggle_track(ui.selected_tracks, album.track_indices[ui.selected - 1]);
             } else if (action == Action::Menu || action == Action::Right) {
-                playback.queue = make_album_queue(index, album.id, false, 0);
-                playback.current_track = queue_current_track(playback.queue);
-                playback.position_seconds = 0;
-                playback.playing = playback.current_track >= 0;
-                ui.page = Page::NowPlaying;
+                std::vector<size_t> tracks = ui.selected_tracks.empty() ? album.track_indices : ui.selected_tracks;
+                open_library_action(std::move(tracks), album.title);
+            } else if (action == Action::Ok || action == Action::PlayPause) {
+                if (ui.selected == 0) {
+                    replace_queue_and_play(album.track_indices, album.title);
+                } else if (ui.selected - 1 < album.track_indices.size()) {
+                    const size_t track_index = album.track_indices[ui.selected - 1];
+                    const std::string label = track_index < index.tracks.size() ? index.tracks[track_index].title : album.title;
+                    replace_queue_and_play(std::vector<size_t>{track_index}, label);
+                }
             }
         }
         break;
     case Page::Artists:
         if (action == Action::Up) {
-            move_selection(index.artists.size(), -1);
+            move_selection_wrapped(ui, index.artists.size(), -1, kLibraryListVisibleRows);
         } else if (action == Action::Down) {
-            move_selection(index.artists.size(), 1);
+            move_selection_wrapped(ui, index.artists.size(), 1, kLibraryListVisibleRows);
         } else if ((action == Action::Ok || action == Action::Right) && ui.selected < index.artists.size()) {
+            push_nav_entry(ui);
             ui.page = Page::ArtistAlbums;
             ui.context_index = ui.selected;
             ui.selected = 0;
             ui.scroll = 0;
         } else if ((action == Action::PlayPause || action == Action::Menu) && ui.selected < index.artists.size()) {
-            playback.queue = make_artist_queue(index, index.artists[ui.selected].name, false, 0);
+            playback.queue = make_artist_queue(index,
+                                               index.artists[ui.selected].name,
+                                               preferred_shuffle(),
+                                               preferred_shuffle_seed());
             playback.current_track = queue_current_track(playback.queue);
             playback.position_seconds = 0;
             playback.playing = playback.current_track >= 0;
-            ui.page = Page::NowPlaying;
+            navigate_to(ui, Page::NowPlaying);
         } else if (action == Action::Back || action == Action::Left) {
-            ui.page = Page::LibraryHome;
-            ui.selected = 2;
-            ui.scroll = 0;
+            navigate_back(ui, Page::LibraryRoot, 1);
         }
         break;
     case Page::ArtistAlbums:
         if (ui.context_index >= index.artists.size()) {
-            ui.page = Page::Artists;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_back(ui, Page::Artists, 0);
         } else {
             const Artist &artist = index.artists[ui.context_index];
+            const std::vector<size_t> artist_tracks = artist_track_indices(index, artist);
             if (action == Action::Up) {
-                move_selection(artist.album_indices.size(), -1);
+                move_selection_wrapped(ui, artist.album_indices.size() + 1, -1, kLibraryListVisibleRows);
             } else if (action == Action::Down) {
-                move_selection(artist.album_indices.size(), 1);
-            } else if ((action == Action::Ok || action == Action::Right) && ui.selected < artist.album_indices.size()) {
-                const size_t album_index = artist.album_indices[ui.selected];
-                if (album_index < index.albums.size()) {
-                    ui.previous_page = Page::ArtistAlbums;
-                    ui.parent_index = ui.context_index;
-                    ui.context_index = album_index;
-                    ui.page = Page::AlbumDetail;
-                    ui.selected = 0;
-                    ui.scroll = 0;
+                move_selection_wrapped(ui, artist.album_indices.size() + 1, 1, kLibraryListVisibleRows);
+            } else if ((action == Action::Ok || action == Action::Right)) {
+                if (ui.selected == 0) {
+                    open_library_action(artist_tracks, artist.name);
+                } else if (ui.selected - 1 < artist.album_indices.size()) {
+                    const size_t album_index = artist.album_indices[ui.selected - 1];
+                    if (album_index < index.albums.size()) {
+                        ui.previous_page = Page::ArtistAlbums;
+                        ui.parent_index = ui.context_index;
+                        push_nav_entry(ui);
+                        ui.context_index = album_index;
+                        ui.page = Page::AlbumDetail;
+                        ui.selected = 0;
+                        ui.scroll = 0;
+                        ui.selected_tracks.clear();
+                    }
                 }
             } else if ((action == Action::PlayPause || action == Action::Menu) && ui.context_index < index.artists.size()) {
-                playback.queue = make_artist_queue(index, artist.name, false, 0);
+                open_library_action(artist_tracks, artist.name);
+            } else if (action == Action::Back || action == Action::Left) {
+                navigate_back(ui, Page::Artists, ui.context_index);
+                if (ui.page == Page::Artists) {
+                    clamp_selection_window(ui, index.artists.size(), kLibraryListVisibleRows);
+                }
+            }
+        }
+        break;
+    case Page::LibraryAction:
+        if (action == Action::Up) {
+            move_selection_wrapped(ui, 5, -1, kLibraryListVisibleRows);
+        } else if (action == Action::Down) {
+            move_selection_wrapped(ui, 5, 1, kLibraryListVisibleRows);
+        } else if (action == Action::Back || action == Action::Left) {
+            navigate_back(ui, ui.action_return_page, 0);
+        } else if (action == Action::Ok || action == Action::Right || action == Action::PlayPause) {
+            if (ui.selected == 4) {
+                navigate_back(ui, ui.action_return_page, 0);
+                break;
+            }
+            if (ui.action_tracks.empty()) {
+                ui.toast = "No tracks";
+                break;
+            }
+            if (ui.selected == 0) {
+                replace_queue_and_play(ui.action_tracks, ui.action_label.empty() ? "SELECTION" : ui.action_label);
+                ui.selected_tracks.clear();
+                ui.action_tracks.clear();
+                break;
+            }
+            if (playback.queue.track_indices.empty()) {
+                const bool shuffle = playback.queue.shuffle;
+                const uint32_t seed = shuffle ? playback.queue.shuffle_seed + 1 : playback.queue.shuffle_seed;
+                playback.queue = make_explicit_queue(ui.action_tracks,
+                                                     ui.action_label.empty() ? "SELECTION" : ui.action_label,
+                                                     shuffle,
+                                                     seed);
                 playback.current_track = queue_current_track(playback.queue);
                 playback.position_seconds = 0;
                 playback.playing = playback.current_track >= 0;
-                ui.page = Page::NowPlaying;
-            } else if (action == Action::Back || action == Action::Left) {
-                ui.page = Page::Artists;
-                ui.selected = ui.context_index;
-                clamp_selection(ui, index.artists.size());
+                navigate_to(ui, Page::NowPlaying);
+                break;
             }
+            size_t insert_at = playback.queue.track_indices.size();
+            if (ui.selected == 1) {
+                insert_at = std::min(playback.queue.current_index + 1, playback.queue.track_indices.size());
+            } else if (ui.selected == 3) {
+                insert_at = 0;
+            }
+            playback.queue.track_indices.insert(playback.queue.track_indices.begin() + static_cast<long>(insert_at),
+                                                ui.action_tracks.begin(),
+                                                ui.action_tracks.end());
+            if (ui.selected == 3) {
+                playback.queue.current_index += ui.action_tracks.size();
+            }
+            playback.current_track = queue_current_track(playback.queue);
+            ui.toast = ui.selected == 1 ? "Queued next" : (ui.selected == 2 ? "Added to end" : "Added to front");
+            ui.selected_tracks.clear();
+            ui.action_tracks.clear();
+            navigate_to(ui, Page::Queue, false);
+            ui.selected = insert_at;
+            clamp_selection_window(ui, playback.queue.track_indices.size(), 6);
         }
         break;
     case Page::Folder:
         if (action == Action::Up) {
-            move_selection(index.tracks.size(), -1);
+            move_selection_wrapped(ui, index.folders.size(), -1, 4);
         } else if (action == Action::Down) {
-            move_selection(index.tracks.size(), 1);
-        } else if ((action == Action::Ok || action == Action::PlayPause) && ui.selected < index.tracks.size()) {
-            playback.queue = make_folder_queue(index, ui.selected, false, 0);
+            move_selection_wrapped(ui, index.folders.size(), 1, 4);
+        } else if ((action == Action::Ok || action == Action::Right) && ui.selected < index.folders.size()) {
+            push_nav_entry(ui);
+            ui.context_index = ui.selected;
+            ui.page = Page::FolderDetail;
+            ui.selected = 0;
+            ui.scroll = 0;
+            ui.selected_tracks.clear();
+        } else if (action == Action::PlayPause && ui.selected < index.folders.size()) {
+            const Folder &folder = index.folders[ui.selected];
+            playback.queue = make_folder_queue(index, folder.id, preferred_shuffle(), preferred_shuffle_seed());
             playback.current_track = queue_current_track(playback.queue);
+            playback.position_seconds = 0;
             playback.playing = playback.current_track >= 0;
-            ui.page = Page::NowPlaying;
+            navigate_to(ui, Page::NowPlaying);
+        } else if (action == Action::Menu && ui.selected < index.folders.size()) {
+            const Folder &folder = index.folders[ui.selected];
+            open_library_action(folder.track_indices, folder.label);
         } else if (action == Action::Back || action == Action::Left) {
-            ui.page = Page::LibraryHome;
-            ui.selected = 4;
-            ui.scroll = 1;
+            navigate_back(ui, Page::LibraryRoot, 3);
+        }
+        break;
+    case Page::FolderDetail:
+        if (action == Action::Back || action == Action::Left || ui.context_index >= index.folders.size()) {
+            const size_t folder_index = ui.context_index;
+            navigate_back(ui, Page::Folder, std::min(folder_index, index.folders.empty() ? 0 : index.folders.size() - 1));
+            if (ui.page == Page::Folder) {
+                clamp_selection_window(ui, index.folders.size(), 4);
+            }
+            ui.selected_tracks.clear();
+        } else {
+            const Folder &folder = index.folders[ui.context_index];
+            if (action == Action::Up) {
+                move_selection_wrapped(ui, folder.track_indices.size() + 1, -1, 4);
+            } else if (action == Action::Down) {
+                move_selection_wrapped(ui, folder.track_indices.size() + 1, 1, 4);
+            } else if (action == Action::Shuffle && ui.selected > 0 && ui.selected - 1 < folder.track_indices.size()) {
+                toggle_track(ui.selected_tracks, folder.track_indices[ui.selected - 1]);
+            } else if (action == Action::Menu || action == Action::Right) {
+                std::vector<size_t> tracks = ui.selected_tracks.empty() ? folder.track_indices : ui.selected_tracks;
+                open_library_action(std::move(tracks), folder.label);
+            } else if (action == Action::Ok || action == Action::PlayPause) {
+                if (ui.selected == 0) {
+                    playback.queue = make_folder_queue(index, folder.id, preferred_shuffle(), preferred_shuffle_seed());
+                    playback.current_track = queue_current_track(playback.queue);
+                    playback.position_seconds = 0;
+                    playback.playing = playback.current_track >= 0;
+                    navigate_to(ui, Page::NowPlaying);
+                } else if (ui.selected - 1 < folder.track_indices.size()) {
+                    const size_t track_index = folder.track_indices[ui.selected - 1];
+                    const std::string label = track_index < index.tracks.size() ? index.tracks[track_index].title : folder.label;
+                    replace_queue_and_play(std::vector<size_t>{track_index}, label);
+                }
+            }
+        }
+        break;
+    case Page::Playlists:
+        if (action == Action::Up) {
+            move_selection_wrapped(ui, index.playlists.size(), -1, 4);
+        } else if (action == Action::Down) {
+            move_selection_wrapped(ui, index.playlists.size(), 1, 4);
+        } else if ((action == Action::Ok || action == Action::Right) && ui.selected < index.playlists.size()) {
+            push_nav_entry(ui);
+            ui.context_index = ui.selected;
+            ui.page = Page::PlaylistDetail;
+            ui.selected = 0;
+            ui.scroll = 0;
+            ui.selected_tracks.clear();
+        } else if (action == Action::PlayPause && ui.selected < index.playlists.size()) {
+            const Playlist &playlist = index.playlists[ui.selected];
+            playback.queue = make_playlist_queue(index, playlist.id, preferred_shuffle(), preferred_shuffle_seed());
+            playback.current_track = queue_current_track(playback.queue);
+            playback.position_seconds = 0;
+            playback.playing = playback.current_track >= 0;
+            navigate_to(ui, Page::NowPlaying);
+        } else if (action == Action::Menu && ui.selected < index.playlists.size()) {
+            const Playlist &playlist = index.playlists[ui.selected];
+            open_library_action(playlist.track_indices, playlist.title);
+        } else if (action == Action::Back || action == Action::Left) {
+            navigate_back(ui, Page::LibraryRoot, 4);
+        }
+        break;
+    case Page::PlaylistDetail:
+        if (action == Action::Back || action == Action::Left || ui.context_index >= index.playlists.size()) {
+            const size_t playlist_index = ui.context_index;
+            navigate_back(ui, Page::Playlists, std::min(playlist_index, index.playlists.empty() ? 0 : index.playlists.size() - 1));
+            if (ui.page == Page::Playlists) {
+                clamp_selection_window(ui, index.playlists.size(), 4);
+            }
+            ui.selected_tracks.clear();
+        } else {
+            const Playlist &playlist = index.playlists[ui.context_index];
+            if (action == Action::Up) {
+                move_selection_wrapped(ui, playlist.track_indices.size() + 1, -1, 4);
+            } else if (action == Action::Down) {
+                move_selection_wrapped(ui, playlist.track_indices.size() + 1, 1, 4);
+            } else if (action == Action::Shuffle && ui.selected > 0 && ui.selected - 1 < playlist.track_indices.size()) {
+                toggle_track(ui.selected_tracks, playlist.track_indices[ui.selected - 1]);
+            } else if (action == Action::Menu || action == Action::Right) {
+                std::vector<size_t> tracks = ui.selected_tracks.empty() ? playlist.track_indices : ui.selected_tracks;
+                open_library_action(std::move(tracks), playlist.title);
+            } else if (action == Action::Ok || action == Action::PlayPause) {
+                if (ui.selected == 0) {
+                    playback.queue = make_playlist_queue(index, playlist.id, preferred_shuffle(), preferred_shuffle_seed());
+                    playback.current_track = queue_current_track(playback.queue);
+                    playback.position_seconds = 0;
+                    playback.playing = playback.current_track >= 0;
+                    navigate_to(ui, Page::NowPlaying);
+                } else if (ui.selected - 1 < playlist.track_indices.size()) {
+                    const size_t track_index = playlist.track_indices[ui.selected - 1];
+                    const std::string label = track_index < index.tracks.size() ? index.tracks[track_index].title : playlist.title;
+                    replace_queue_and_play(std::vector<size_t>{track_index}, label);
+                }
+            }
         }
         break;
     case Page::LofiPresets:
         if (action == Action::Up) {
-            move_selection(kLofiPresetChoiceCount, -1);
+            move_selection_wrapped(ui, kLofiPresetChoiceCount, -1, 4);
         } else if (action == Action::Down) {
-            move_selection(kLofiPresetChoiceCount, 1);
+            move_selection_wrapped(ui, kLofiPresetChoiceCount, 1, 4);
         } else if (action == Action::Left) {
             playback.lofi = lofi_preset(LofiPreset::Off);
             ui.toast = "Lo-Fi Off";
         } else if (action == Action::Right || action == Action::Menu) {
-            ui.page = Page::LofiEdit;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_to(ui, Page::LofiEdit);
         } else if (action == Action::Ok) {
             playback.lofi = lofi_preset(kLofiPresetChoices[std::min(ui.selected, kLofiPresetChoiceCount - 1)]);
             ui.toast = std::string("Lo-Fi ") + to_string(playback.lofi.preset);
         } else if (action == Action::Back) {
-            ui.page = ui.previous_page;
+            navigate_back(ui, ui.previous_page, 0);
         }
         break;
     case Page::LofiEdit:
         if (action == Action::Up) {
-            move_selection(6, -1);
+            move_selection_wrapped(ui, 6, -1, 5);
         } else if (action == Action::Down) {
-            move_selection(6, 1);
+            move_selection_wrapped(ui, 6, 1, 5);
         } else if (action == Action::Left || action == Action::Right) {
             int *values[] = {&playback.lofi.intensity, &playback.lofi.warmth, &playback.lofi.noise,
                              &playback.lofi.wobble, &playback.lofi.space, &playback.lofi.softness};
@@ -1434,9 +2536,7 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
         } else if (action == Action::Ok) {
             ui.toast = "Lo-Fi Saved";
         } else if (action == Action::Back) {
-            ui.page = Page::LofiPresets;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_back(ui, Page::LofiPresets, 0);
         }
         break;
     case Page::NowPlaying:
@@ -1457,37 +2557,44 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
             playback.position_seconds = std::max(0, playback.position_seconds - 10);
             ui.toast = "Seek " + std::to_string(playback.position_seconds) + "s";
         } else if (action == Action::Up) {
-            playback.volume = std::min(100, playback.volume + 5);
-            ui.toast = "Volume " + std::to_string(playback.volume);
+            adjust_user_volume(playback, ui, 5);
         } else if (action == Action::Down) {
-            playback.volume = std::max(0, playback.volume - 5);
-            ui.toast = "Volume " + std::to_string(playback.volume);
+            adjust_user_volume(playback, ui, -5);
         } else if (action == Action::Menu) {
-            ui.page = Page::PlaybackMenu;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_to(ui, Page::PlaybackMenu);
         } else if (action == Action::Back) {
-            ui.page = Page::LibraryHome;
+            navigate_back(ui, Page::LibraryHome, 4);
         }
         break;
     case Page::PlaybackMenu:
         if (action == Action::Up) {
-            move_selection(4, -1);
+            ui.selected = ui.selected == 0 ? 5 : ui.selected - 1;
+            ui.scroll = 0;
         } else if (action == Action::Down) {
-            move_selection(4, 1);
+            ui.selected = (ui.selected + 1) % 6;
+            ui.scroll = 0;
         } else if (ui.selected == 0 && action == Action::Left) {
-            playback.volume = std::max(0, playback.volume - 5);
-            ui.toast = "Volume " + std::to_string(playback.volume);
+            adjust_user_volume(playback, ui, -5);
         } else if (ui.selected == 0 && (action == Action::Right || action == Action::Ok)) {
-            playback.volume = std::min(100, playback.volume + 5);
-            ui.toast = "Volume " + std::to_string(playback.volume);
+            adjust_user_volume(playback, ui, 5);
         } else if (ui.selected == 1 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
-            playback.repeat = playback.repeat == RepeatMode::Off   ? RepeatMode::One
-                              : playback.repeat == RepeatMode::One ? RepeatMode::Album
-                              : playback.repeat == RepeatMode::Album ? RepeatMode::All
-                                                                     : RepeatMode::Off;
-            ui.toast = std::string("Repeat ") + to_string(playback.repeat);
+            playback.brightness_percent =
+                step_brightness_percent(playback.brightness_percent, action == Action::Left ? -1 : 1);
+            ui.toast = "Brightness " + std::to_string(playback.brightness_percent) + "%";
         } else if (ui.selected == 2 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
+            if (action == Action::Left) {
+                playback.repeat = playback.repeat == RepeatMode::Off     ? RepeatMode::All
+                                  : playback.repeat == RepeatMode::All   ? RepeatMode::Album
+                                  : playback.repeat == RepeatMode::Album ? RepeatMode::One
+                                                                         : RepeatMode::Off;
+            } else {
+                playback.repeat = playback.repeat == RepeatMode::Off   ? RepeatMode::One
+                                  : playback.repeat == RepeatMode::One ? RepeatMode::Album
+                                  : playback.repeat == RepeatMode::Album ? RepeatMode::All
+                                                                         : RepeatMode::Off;
+            }
+            ui.toast = std::string("Repeat ") + to_string(playback.repeat);
+        } else if (ui.selected == 3 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
             const int previous_track = queue_current_track(playback.queue);
             playback.queue.shuffle = !playback.queue.shuffle;
             if (!playback.queue.track_indices.empty()) {
@@ -1498,8 +2605,11 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
                     playback.queue = make_artist_queue(index, playback.queue.source_id, playback.queue.shuffle,
                                                        playback.queue.shuffle_seed + 1);
                 } else if (playback.queue.source_type == "folder") {
-                    playback.queue = make_folder_queue(index, playback.queue.current_index, playback.queue.shuffle,
+                    playback.queue = make_folder_queue(index, playback.queue.source_id, playback.queue.shuffle,
                                                        playback.queue.shuffle_seed + 1);
+                } else if (playback.queue.source_type == "playlist") {
+                    playback.queue = make_playlist_queue(index, playback.queue.source_id, playback.queue.shuffle,
+                                                        playback.queue.shuffle_seed + 1);
                 } else {
                     playback.queue = make_all_tracks_queue(index, playback.queue.shuffle, playback.queue.shuffle_seed + 1);
                 }
@@ -1514,14 +2624,16 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
                 playback.current_track = queue_current_track(playback.queue);
             }
             ui.toast = playback.queue.shuffle ? "Shuffle On" : "Shuffle Off";
-        } else if (ui.selected == 3 && (action == Action::Right || action == Action::Ok)) {
-            ui.page = Page::Queue;
+        } else if (ui.selected == 4 && (action == Action::Right || action == Action::Ok)) {
+            navigate_to(ui, Page::Queue, false);
             ui.selected = playback.queue.current_index;
             clamp_selection(ui, playback.queue.track_indices.size());
+        } else if (ui.selected == 5 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
+            playback.screen_off_seconds =
+                step_screen_off_seconds(playback.screen_off_seconds, action == Action::Left ? -1 : 1);
+            ui.toast = "Screen Off " + format_screen_off_seconds(playback.screen_off_seconds);
         } else if (action == Action::Menu || action == Action::Back || action == Action::Left) {
-            ui.page = Page::NowPlaying;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_back(ui, ui.previous_page, 0);
         }
         break;
     case Page::Queue:
@@ -1529,44 +2641,42 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
             move_selection(playback.queue.track_indices.size(), -1);
         } else if (action == Action::Down) {
             move_selection(playback.queue.track_indices.size(), 1);
-        } else if ((action == Action::Ok || action == Action::PlayPause || action == Action::Right) &&
+        } else if (action == Action::Left && !playback.queue.track_indices.empty()) {
+            ui.selected = ui.selected < 6 ? 0 : ui.selected - 6;
+        } else if (action == Action::Right && !playback.queue.track_indices.empty()) {
+            ui.selected = std::min(playback.queue.track_indices.size() - 1, ui.selected + 6);
+        } else if ((action == Action::Ok || action == Action::PlayPause) &&
                    ui.selected < playback.queue.track_indices.size()) {
             playback.queue.current_index = ui.selected;
             playback.current_track = queue_current_track(playback.queue);
             playback.position_seconds = 0;
             playback.playing = playback.current_track >= 0;
-            ui.page = Page::NowPlaying;
-        } else if (action == Action::Back || action == Action::Left) {
+            navigate_to(ui, Page::NowPlaying);
+        } else if (action == Action::Back) {
             ui.selected = playback.queue.current_index;
             clamp_selection(ui, playback.queue.track_indices.size());
-            ui.page = Page::NowPlaying;
+            navigate_back(ui, Page::NowPlaying, 0);
         }
         break;
     case Page::Scan:
-        if (action == Action::Back || action == Action::Left || action == Action::Ok || action == Action::Right) {
-            ui.page = Page::LibraryHome;
-            ui.selected = 6;
-            ui.scroll = 3;
+        if (action == Action::Back || action == Action::Left) {
+            navigate_back(ui, Page::LibraryHome, 0);
+        } else if (action == Action::Ok || action == Action::Right) {
+            reset_to_home(ui);
         }
         break;
     case Page::Empty:
         if (action == Action::Ok || action == Action::PlayPause || action == Action::Menu) {
-            ui.page = Page::Scan;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_to(ui, Page::Scan);
         } else if (action == Action::Right) {
-            ui.page = Page::Folder;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_to(ui, Page::Folder);
         } else if (action == Action::Back || action == Action::Left) {
-            ui.page = Page::LibraryHome;
-            ui.selected = 0;
-            ui.scroll = 0;
+            navigate_back(ui, Page::LibraryHome, 0);
         }
         break;
     default:
         if (action == Action::Back || action == Action::Left) {
-            ui.page = Page::LibraryHome;
+            navigate_back(ui, Page::LibraryHome, 0);
         }
         break;
     }
@@ -1576,6 +2686,9 @@ std::vector<std::string> screen_to_lines(const ScreenModel &screen)
 {
     std::vector<std::string> lines;
     lines.push_back("[" + screen.title + "] " + screen.status);
+    if (!screen.subtitle.empty() || !screen.meta.empty()) {
+        lines.push_back(screen.subtitle + " | " + screen.meta);
+    }
     for (const ScreenLine &row : screen.rows) {
         lines.push_back(row.right.empty() ? row.left : row.left + " | " + row.right);
     }

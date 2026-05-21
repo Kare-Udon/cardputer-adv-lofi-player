@@ -10,7 +10,9 @@ namespace lofi_board {
 
 esp_err_t init_display(void);
 esp_err_t draw_screen(const lofi::ScreenModel &screen);
-esp_err_t draw_color_test(void);
+void set_screen_brightness_percent(int percent);
+void set_screen_awake(bool awake);
+bool screen_awake(void);
 void tick_display(void);
 void dump_framebuffer_to_serial(void);
 

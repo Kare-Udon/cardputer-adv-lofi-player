@@ -26,11 +26,17 @@ enum class LofiPreset {
 enum class Page {
     NowPlaying,
     LibraryHome,
+    LibraryRoot,
+    Songs,
     Albums,
     Artists,
     ArtistAlbums,
     AlbumDetail,
+    LibraryAction,
     Folder,
+    FolderDetail,
+    Playlists,
+    PlaylistDetail,
     LofiPresets,
     LofiEdit,
     PlaybackMenu,
@@ -56,6 +62,8 @@ enum class Action {
     Repeat,
     Lofi,
     Menu,
+    Home,
+    Scan,
 };
 
 struct Track {
@@ -85,10 +93,25 @@ struct Artist {
     size_t loose_track_count = 0;
 };
 
+struct Folder {
+    std::string id;
+    std::string label;
+    std::string path;
+    std::vector<size_t> track_indices;
+};
+
+struct Playlist {
+    std::string id;
+    std::string title;
+    std::vector<size_t> track_indices;
+};
+
 struct LibraryIndex {
     std::vector<Track> tracks;
     std::vector<Album> albums;
     std::vector<Artist> artists;
+    std::vector<Folder> folders;
+    std::vector<Playlist> playlists;
     std::vector<std::string> warnings;
 };
 
@@ -114,21 +137,50 @@ struct LofiProfile {
 struct PlaybackState {
     int current_track = -1;
     int position_seconds = 0;
-    int volume = 70;
+    int volume = 50;
+    int brightness_percent = 100;
+    int screen_off_seconds = 60;
     RepeatMode repeat = RepeatMode::Off;
     bool playing = false;
     Queue queue;
     LofiProfile lofi;
 };
 
+struct PlaybackRestoreResult {
+    bool settings_restored = false;
+    bool queue_restored = false;
+};
+
+struct QueueSnapshotRestoreResult {
+    bool restored = false;
+    bool current_restored = false;
+    size_t saved_count = 0;
+    size_t restored_count = 0;
+    size_t missing_count = 0;
+};
+
+struct UiNavEntry {
+    Page page = Page::LibraryHome;
+    size_t context_index = 0;
+    size_t parent_index = 0;
+    size_t selected = 0;
+    size_t scroll = 0;
+};
+
 struct UiState {
     Page page = Page::LibraryHome;
     Page previous_page = Page::LibraryHome;
+    Page action_return_page = Page::LibraryRoot;
     size_t context_index = 0;
     size_t parent_index = 0;
     size_t selected = 0;
     size_t scroll = 0;
     std::string toast;
+    std::string action_label;
+    std::vector<size_t> selected_tracks;
+    std::vector<size_t> action_tracks;
+    std::vector<UiNavEntry> back_stack;
+    bool volume_boost_warning_armed = false;
 };
 
 struct ScreenLine {
@@ -138,6 +190,8 @@ struct ScreenLine {
 
 struct ScreenModel {
     std::string title;
+    std::string subtitle;
+    std::string meta;
     std::vector<ScreenLine> rows;
     std::string soft_left;
     std::string soft_center;
@@ -155,6 +209,8 @@ Queue make_album_queue(const LibraryIndex &index, const std::string &album_id, b
 Queue make_artist_queue(const LibraryIndex &index, const std::string &artist_name, bool shuffle, uint32_t seed);
 Queue make_all_tracks_queue(const LibraryIndex &index, bool shuffle, uint32_t seed);
 Queue make_folder_queue(const LibraryIndex &index, size_t selected_order_index, bool shuffle, uint32_t seed);
+Queue make_folder_queue(const LibraryIndex &index, const std::string &folder_id, bool shuffle, uint32_t seed);
+Queue make_playlist_queue(const LibraryIndex &index, const std::string &playlist_id, bool shuffle, uint32_t seed);
 int queue_current_track(const Queue &queue);
 int queue_next(Queue &queue, RepeatMode repeat);
 int queue_previous(Queue &queue);
@@ -165,10 +221,20 @@ const char *to_string(RepeatMode repeat);
 const char *to_string(Page page);
 LofiPreset preset_from_string(const std::string &value);
 RepeatMode repeat_from_string(const std::string &value);
+int audio_volume_from_user_percent(int volume);
 
 std::string serialize_playback_state(const PlaybackState &state);
 bool parse_playback_state(const std::string &text, PlaybackState &out);
 bool restore_playback_queue(const LibraryIndex &index, PlaybackState &state, bool resume_playing);
+PlaybackRestoreResult restore_saved_playback_state(const LibraryIndex &index,
+                                                   const PlaybackState &saved,
+                                                   PlaybackState &state,
+                                                   bool resume_playing);
+std::string serialize_queue_snapshot(const LibraryIndex &index, const PlaybackState &state);
+QueueSnapshotRestoreResult restore_queue_snapshot(const LibraryIndex &index,
+                                                  const std::string &text,
+                                                  PlaybackState &state,
+                                                  bool resume_playing);
 
 ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playback, const UiState &ui);
 void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &ui, Action action);

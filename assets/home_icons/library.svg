@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="352" height="352" viewBox="0 0 352 352">
+  <defs>
+    <linearGradient id="teal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#96ece8"/>
+      <stop offset="1" stop-color="#54b8b7"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffc677"/>
+      <stop offset="1" stop-color="#f09a3f"/>
+    </linearGradient>
+    <linearGradient id="cream" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff4dc"/>
+      <stop offset="1" stop-color="#d9c8a9"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="170%">
+      <feDropShadow dx="0" dy="9" stdDeviation="5" flood-color="#050408" flood-opacity="0.65"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <!-- Tall sleeve stack. The icon should read as a record crate first, not an open pit. -->
+    <path d="M88 126 L124 95 L124 235 L88 249 Z" fill="url(#teal)"/>
+    <path d="M107 124 L132 103 L132 232 L107 242 Z" fill="#15121a"/>
+
+    <path d="M121 117 L160 88 L160 236 L121 253 Z" fill="url(#orange)"/>
+    <path d="M140 118 L166 99 L166 235 L140 246 Z" fill="#15121a"/>
+
+    <path d="M160 112 L201 89 L201 241 L160 257 Z" fill="url(#cream)"/>
+    <path d="M181 116 L207 102 L207 239 L181 249 Z" fill="#15121a"/>
+
+    <path d="M203 122 L242 101 L242 250 L203 263 Z" fill="url(#teal)"/>
+    <path d="M222 125 L248 111 L248 248 L222 257 Z" fill="#15121a"/>
+
+    <!-- Main orange cover and vinyl, visible in the reference as the right focal element. -->
+    <path d="M234 134 L311 96 L311 252 L234 288 Z" fill="url(#orange)"/>
+    <path d="M265 159 L311 137 L311 225 L265 250 Z" fill="url(#cream)"/>
+    <ellipse cx="289" cy="199" rx="34" ry="44" fill="#0d0c10"/>
+    <ellipse cx="289" cy="199" rx="13" ry="15" fill="#fff4dc"/>
+    <circle cx="289" cy="199" r="4" fill="#a2988a"/>
+
+    <!-- Crate top lip: narrow rim, not a large black diamond. -->
+    <path d="M55 224 L173 171 L304 224 L185 290 Z" fill="url(#teal)"/>
+    <path d="M73 224 L173 184 L284 227 L185 279 Z" fill="#15121a"/>
+    <path d="M92 224 L174 194 L262 229 L186 269 Z" fill="#453c47"/>
+    <path d="M60 232 L92 224 L186 269 L166 290 Z" fill="#0d0c10"/>
+    <path d="M186 269 L284 227 L303 234 L186 294 Z" fill="#0d0c10"/>
+
+    <!-- Front-left crate face with orange label slot. -->
+    <path d="M55 232 L185 290 L185 329 L55 279 Z" fill="url(#teal)"/>
+    <path d="M73 243 L169 286 L169 309 L73 272 Z" fill="#15121a"/>
+    <path d="M96 261 L163 291 L163 309 L96 283 Z" fill="url(#orange)"/>
+    <path d="M108 271 L157 293 L157 300 L108 281 Z" fill="#0d0c10" opacity="0.8"/>
+
+    <!-- Front-right crate face. -->
+    <path d="M185 290 L304 224 L304 276 L185 329 Z" fill="url(#teal)"/>
+    <path d="M203 289 L285 245 L285 267 L203 303 Z" fill="#15121a"/>
+    <path d="M242 294 L287 270 L287 279 L242 300 Z" fill="#453c47"/>
+
+    <!-- Heavy cyan edge strokes, like the mockup's pixel-art outline. -->
+    <path d="M55 224 L173 171 L304 224" fill="none" stroke="#b0f4ef" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M55 232 L185 290 L304 224" fill="none" stroke="#7dcdcd" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M55 232 L55 279 L185 329 L304 276 L304 224" fill="none" stroke="#5bbbbb" stroke-width="6" stroke-linejoin="round"/>
+
+    <!-- Rivets. -->
+    <circle cx="72" cy="258" r="4" fill="#96ece8"/>
+    <circle cx="73" cy="292" r="4" fill="#96ece8"/>
+    <circle cx="169" cy="282" r="4" fill="#96ece8"/>
+    <circle cx="171" cy="317" r="4" fill="#96ece8"/>
+    <circle cx="288" cy="244" r="4" fill="#96ece8"/>
+    <circle cx="289" cy="280" r="4" fill="#96ece8"/>
+    <circle cx="220" cy="316" r="4" fill="#96ece8"/>
+  </g>
+</svg>
