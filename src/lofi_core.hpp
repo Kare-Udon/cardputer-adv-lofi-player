@@ -73,6 +73,11 @@ struct Track {
     std::string artist;
     std::string album;
     std::string album_artist;
+    std::string album_art_path;
+    std::string album_art_cache_path;
+    uint32_t album_art_offset = 0;
+    uint32_t album_art_size = 0;
+    bool album_art_embedded = false;
     int track_no = 0;
     int duration_seconds = 0;
     std::string format;
@@ -197,8 +202,11 @@ struct ScreenModel {
     std::string soft_center;
     std::string soft_right;
     std::string status;
+    std::string album_art_cache_path;
     int position_seconds = 0;
     int duration_seconds = 0;
+    bool background_task_active = false;
+    uint8_t background_task_frame = 0;
 };
 
 bool is_audio_path(const std::string &path);

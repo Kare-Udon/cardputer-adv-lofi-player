@@ -1606,6 +1606,9 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
             const Track &track = index.tracks[static_cast<size_t>(current)];
             screen.position_seconds = playback.position_seconds;
             screen.duration_seconds = track.duration_seconds;
+            if (!playback.playing || playback.position_seconds > 0) {
+                screen.album_art_cache_path = track.album_art_cache_path;
+            }
             screen.rows.push_back({track.title, playback.playing ? ">" : "||"});
             screen.rows.push_back({track.artist + " / " + track.album, ""});
             screen.rows.push_back({"Pos " + std::to_string(playback.position_seconds) + "s", std::string("Repeat ") + to_string(playback.repeat)});
@@ -2689,6 +2692,12 @@ std::vector<std::string> screen_to_lines(const ScreenModel &screen)
     if (!screen.subtitle.empty() || !screen.meta.empty()) {
         lines.push_back(screen.subtitle + " | " + screen.meta);
     }
+    if (!screen.album_art_cache_path.empty()) {
+        lines.push_back("cover:" + screen.album_art_cache_path);
+    }
+    if (screen.background_task_active) {
+        lines.push_back("background:" + std::to_string(screen.background_task_frame % 4));
+    }
     for (const ScreenLine &row : screen.rows) {
         lines.push_back(row.right.empty() ? row.left : row.left + " | " + row.right);
     }
@@ -2719,6 +2728,9 @@ std::string screen_auto_snapshot(const ScreenModel &screen, uint32_t revision)
         << " page=\"" << screen.title << "\""
         << " status=\"" << screen.status << "\""
         << " rows=" << screen.rows.size()
+        << " cover=" << (screen.album_art_cache_path.empty() ? 0 : 1)
+        << " bg=" << (screen.background_task_active ? 1 : 0)
+        << " bg_frame=" << static_cast<unsigned>(screen.background_task_frame % 4)
         << " soft=\"" << screen.soft_left << "|" << screen.soft_center << "|" << screen.soft_right << "\"";
     return out.str();
 }

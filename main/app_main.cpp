@@ -1,4 +1,5 @@
 #include "lofi_core.hpp"
+#include "lofi_aac_cache.hpp"
 #include "lofi_audio.hpp"
 #include "lofi_board.hpp"
 #include "lofi_selftest_mp3.hpp"
@@ -10,19 +11,28 @@
 #include "driver/spi_master.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "esp32s3/rom/tjpgd.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "sdmmc_cmd.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
 #include <fcntl.h>
+#include <new>
+#include <strings.h>
+#include <sys/stat.h>
+#include <utility>
 #include <unistd.h>
 
 namespace {
@@ -42,6 +52,28 @@ constexpr const char *kQueueFile = "/sdcard/Music/LOFI/QUEUE.TXT";
 constexpr const char *kIndexFile = "/sdcard/Music/LOFI/INDEX.TXT";
 constexpr const char *kSelfTestWavFile = "/sdcard/Music/LOFI/SELFTEST.WAV";
 constexpr const char *kSelfTestMp3File = "/sdcard/Music/LOFI/SELFTEST.MP3";
+constexpr const char *kCoverCacheDir = "/sdcard/Music/LOFI/COVERS";
+constexpr const char *kAudioCacheDir = "/sdcard/Music/LOFI/AUDIO_CACHE";
+constexpr int kCoverThumbWidth = 72;
+constexpr int kCoverThumbHeight = 72;
+constexpr TickType_t kLibrarySyncIdleDelay = pdMS_TO_TICKS(60000);
+constexpr TickType_t kAudioCacheIdleDelay = pdMS_TO_TICKS(3000);
+constexpr TickType_t kAudioCacheAttemptInterval = pdMS_TO_TICKS(1500);
+constexpr uint64_t kSlowStartAudioOffsetThreshold = 512 * 1024;
+constexpr size_t kAudioCacheMinLargestHeapBlock = 24 * 1024;
+
+volatile bool g_audio_cache_cancel_requested = false;
+
+bool audio_cache_cancel_requested(void *)
+{
+    return g_audio_cache_cancel_requested;
+}
+
+void set_background_task_indicator(lofi::ScreenModel &screen, bool active, TickType_t now_ticks)
+{
+    screen.background_task_active = active;
+    screen.background_task_frame = active ? static_cast<uint8_t>((now_ticks / pdMS_TO_TICKS(180)) % 4) : 0;
+}
 
 struct MediaFormatCounts {
     size_t mp3 = 0;
@@ -49,6 +81,30 @@ struct MediaFormatCounts {
     size_t m4a_aac = 0;
     size_t other = 0;
 };
+
+struct LibraryScanResult {
+    lofi::LibraryIndex library;
+    bool using_samples = false;
+    bool from_cache = false;
+};
+
+struct LibraryScanTaskContext {
+    bool sd_mounted = false;
+    QueueHandle_t result_queue = nullptr;
+};
+
+struct AudioCacheResult {
+    bool attempted = false;
+    bool built = false;
+};
+
+struct AudioCacheTaskContext {
+    lofi::Track track;
+    QueueHandle_t result_queue = nullptr;
+};
+
+void log_library_summary(const lofi::LibraryIndex &library);
+void populate_track_album_art_sources(lofi::LibraryIndex &library);
 
 uint32_t read_be32(FILE *file, bool &ok)
 {
@@ -71,6 +127,22 @@ uint64_t read_be64(FILE *file, bool &ok)
     const uint32_t lo = read_be32(file, lo_ok);
     ok = hi_ok && lo_ok;
     return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+uint32_t read_syncsafe32_bytes(const uint8_t *bytes)
+{
+    return (static_cast<uint32_t>(bytes[0] & 0x7f) << 21) |
+           (static_cast<uint32_t>(bytes[1] & 0x7f) << 14) |
+           (static_cast<uint32_t>(bytes[2] & 0x7f) << 7) |
+           static_cast<uint32_t>(bytes[3] & 0x7f);
+}
+
+uint32_t read_be32_bytes(const uint8_t *bytes)
+{
+    return (static_cast<uint32_t>(bytes[0]) << 24) |
+           (static_cast<uint32_t>(bytes[1]) << 16) |
+           (static_cast<uint32_t>(bytes[2]) << 8) |
+           static_cast<uint32_t>(bytes[3]);
 }
 
 bool is_mp4_container_atom(uint32_t type)
@@ -227,6 +299,44 @@ void populate_track_durations(lofi::LibraryIndex &library)
              static_cast<unsigned>(library.tracks.size()));
 }
 
+std::vector<std::string> load_cached_music_paths(bool sd_mounted, bool *cache_loaded)
+{
+    if (cache_loaded) {
+        *cache_loaded = false;
+    }
+    if (!sd_mounted) {
+        return {};
+    }
+
+    std::string text;
+    std::vector<std::string> paths;
+    if (!lofi::read_text_file(kIndexFile, text) || !lofi::parse_path_index(text, paths)) {
+        return {};
+    }
+    if (cache_loaded) {
+        *cache_loaded = true;
+    }
+    ESP_LOGI(TAG, "INDEX_LOAD ok path=%s tracks=%u", kIndexFile, static_cast<unsigned>(paths.size()));
+    return paths;
+}
+
+LibraryScanResult build_library_from_paths(const std::vector<std::string> &music_paths,
+                                           bool using_samples,
+                                           bool from_cache,
+                                           bool load_durations)
+{
+    LibraryScanResult result;
+    result.using_samples = using_samples;
+    result.from_cache = from_cache;
+    result.library = lofi::build_library_index(music_paths);
+    populate_track_album_art_sources(result.library);
+    if (load_durations) {
+        populate_track_durations(result.library);
+    }
+    log_library_summary(result.library);
+    return result;
+}
+
 std::vector<std::string> scan_music_paths(bool sd_mounted, bool *using_samples)
 {
     if (using_samples) {
@@ -258,6 +368,13 @@ std::vector<std::string> scan_music_paths(bool sd_mounted, bool *using_samples)
         }
     }
     return music_paths;
+}
+
+LibraryScanResult scan_library(bool sd_mounted)
+{
+    bool using_samples = false;
+    const std::vector<std::string> music_paths = scan_music_paths(sd_mounted, &using_samples);
+    return build_library_from_paths(music_paths, using_samples, false, true);
 }
 
 bool mount_sdcard(sdmmc_card_t **out_card)
@@ -332,6 +449,739 @@ void log_library_summary(const lofi::LibraryIndex &library)
              static_cast<unsigned>(library.albums.size()),
              static_cast<unsigned>(library.artists.size()));
     log_media_format_counts(library);
+}
+
+bool file_exists(const std::string &path)
+{
+    struct stat st = {};
+    return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string parent_dir(const std::string &path)
+{
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) {
+        return "";
+    }
+    return path.substr(0, slash);
+}
+
+std::string find_sidecar_album_art(const std::string &track_path)
+{
+    const std::string dir = parent_dir(track_path);
+    if (dir.empty()) {
+        return "";
+    }
+    static constexpr const char *kCandidates[] = {
+        "cover.jpg", "folder.jpg", "album.jpg", "front.jpg",
+        "Cover.jpg", "Folder.jpg", "Album.jpg", "Front.jpg",
+        "cover.jpeg", "folder.jpeg", "album.jpeg", "front.jpeg",
+    };
+    for (const char *name : kCandidates) {
+        const std::string candidate = dir + "/" + name;
+        if (file_exists(candidate)) {
+            return candidate;
+        }
+    }
+    return "";
+}
+
+enum class EmbeddedArtKind {
+    None,
+    Jpeg,
+    Other,
+};
+
+struct EmbeddedAlbumArt {
+    EmbeddedArtKind kind = EmbeddedArtKind::None;
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+
+bool range_starts_with_jpeg(FILE *file, uint32_t offset, uint32_t size)
+{
+    if (size < 2 || std::fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+        return false;
+    }
+    uint8_t marker[2] = {};
+    return std::fread(marker, 1, sizeof(marker), file) == sizeof(marker) &&
+           marker[0] == 0xff && marker[1] == 0xd8;
+}
+
+bool mime_is_jpeg(const std::string &mime)
+{
+    return strcasecmp(mime.c_str(), "image/jpeg") == 0 ||
+           strcasecmp(mime.c_str(), "image/jpg") == 0;
+}
+
+EmbeddedAlbumArt parse_id3_apic_payload(FILE *file,
+                                        uint32_t payload_offset,
+                                        uint32_t payload_size)
+{
+    EmbeddedAlbumArt art;
+    if (payload_size < 8 || std::fseek(file, static_cast<long>(payload_offset), SEEK_SET) != 0) {
+        return art;
+    }
+    const uint32_t payload_end = payload_offset + payload_size;
+    uint8_t encoding = 0;
+    if (std::fread(&encoding, 1, 1, file) != 1) {
+        return art;
+    }
+
+    std::string mime;
+    while (static_cast<uint32_t>(std::ftell(file)) < payload_end) {
+        int ch = std::fgetc(file);
+        if (ch < 0 || ch == 0) {
+            break;
+        }
+        if (mime.size() < 48) {
+            mime.push_back(static_cast<char>(ch));
+        }
+    }
+    if (static_cast<uint32_t>(std::ftell(file)) >= payload_end || std::fgetc(file) < 0) {
+        return art;
+    }
+
+    if (encoding == 1 || encoding == 2) {
+        int previous = -1;
+        while (static_cast<uint32_t>(std::ftell(file)) < payload_end) {
+            int ch = std::fgetc(file);
+            if (previous == 0 && ch == 0) {
+                break;
+            }
+            previous = ch;
+        }
+    } else {
+        while (static_cast<uint32_t>(std::ftell(file)) < payload_end) {
+            int ch = std::fgetc(file);
+            if (ch < 0 || ch == 0) {
+                break;
+            }
+        }
+    }
+    const long image_offset = std::ftell(file);
+    if (image_offset < 0 || static_cast<uint32_t>(image_offset) >= payload_end) {
+        return art;
+    }
+
+    art.offset = static_cast<uint32_t>(image_offset);
+    art.size = payload_end - art.offset;
+    art.kind = mime_is_jpeg(mime) || range_starts_with_jpeg(file, art.offset, art.size) ? EmbeddedArtKind::Jpeg
+                                                                                         : EmbeddedArtKind::Other;
+    return art;
+}
+
+EmbeddedAlbumArt find_mp3_embedded_album_art(const std::string &path)
+{
+    EmbeddedAlbumArt art;
+    FILE *file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        return art;
+    }
+    uint8_t header[10] = {};
+    if (std::fread(header, 1, sizeof(header), file) != sizeof(header) ||
+        std::memcmp(header, "ID3", 3) != 0) {
+        std::fclose(file);
+        return art;
+    }
+
+    const uint8_t major = header[3];
+    const uint8_t flags = header[5];
+    const uint32_t tag_size = read_syncsafe32_bytes(header + 6);
+    uint32_t cursor = 10;
+    const uint32_t tag_end = cursor + tag_size;
+
+    if (flags & 0x40) {
+        if (std::fseek(file, static_cast<long>(cursor), SEEK_SET) == 0) {
+            uint8_t ext[4] = {};
+            if (std::fread(ext, 1, sizeof(ext), file) == sizeof(ext)) {
+                uint32_t ext_size = major == 4 ? read_syncsafe32_bytes(ext) : read_be32_bytes(ext);
+                cursor += 4 + ext_size;
+            }
+        }
+    }
+
+    while (cursor + 10 <= tag_end && std::fseek(file, static_cast<long>(cursor), SEEK_SET) == 0) {
+        uint8_t frame[10] = {};
+        if (std::fread(frame, 1, sizeof(frame), file) != sizeof(frame) || frame[0] == 0) {
+            break;
+        }
+        const uint32_t frame_size = major == 4 ? read_syncsafe32_bytes(frame + 4) : read_be32_bytes(frame + 4);
+        const uint32_t payload_offset = cursor + 10;
+        if (frame_size == 0 || payload_offset + frame_size > tag_end) {
+            break;
+        }
+        if (std::memcmp(frame, "APIC", 4) == 0) {
+            art = parse_id3_apic_payload(file, payload_offset, frame_size);
+            break;
+        }
+        cursor = payload_offset + frame_size;
+    }
+    std::fclose(file);
+    return art;
+}
+
+bool is_mp4_cover_container_atom(uint32_t type)
+{
+    return type == 0x6d6f6f76 || // moov
+           type == 0x75647461 || // udta
+           type == 0x696c7374 || // ilst
+           type == 0x636f7672;   // covr
+}
+
+EmbeddedAlbumArt scan_m4a_atoms_for_cover(FILE *file, long end_pos, int depth)
+{
+    EmbeddedAlbumArt art;
+    if (depth > 8) {
+        return art;
+    }
+    while (true) {
+        const long atom_start = std::ftell(file);
+        if (atom_start < 0 || atom_start + 8 > end_pos) {
+            return art;
+        }
+        bool ok = false;
+        uint64_t atom_size = read_be32(file, ok);
+        if (!ok) {
+            return art;
+        }
+        const uint32_t type = read_be32(file, ok);
+        if (!ok) {
+            return art;
+        }
+        uint64_t header_size = 8;
+        if (atom_size == 1) {
+            atom_size = read_be64(file, ok);
+            if (!ok) {
+                return art;
+            }
+            header_size = 16;
+        } else if (atom_size == 0) {
+            atom_size = static_cast<uint64_t>(end_pos - atom_start);
+        }
+        if (atom_size < header_size) {
+            return art;
+        }
+        const uint64_t atom_end64 = static_cast<uint64_t>(atom_start) + atom_size;
+        if (atom_end64 > static_cast<uint64_t>(end_pos)) {
+            return art;
+        }
+        const long atom_end = static_cast<long>(atom_end64);
+        long payload_start = atom_start + static_cast<long>(header_size);
+
+        if (type == 0x64617461 && atom_end - payload_start > 8) { // data
+            uint8_t data_header[8] = {};
+            if (std::fread(data_header, 1, sizeof(data_header), file) != sizeof(data_header)) {
+                return art;
+            }
+            const uint32_t data_type = read_be32_bytes(data_header) & 0xffffffu;
+            art.offset = static_cast<uint32_t>(payload_start + 8);
+            art.size = static_cast<uint32_t>(atom_end - payload_start - 8);
+            art.kind = (data_type == 13 || range_starts_with_jpeg(file, art.offset, art.size))
+                           ? EmbeddedArtKind::Jpeg
+                           : EmbeddedArtKind::Other;
+            return art;
+        }
+
+        if (type == 0x6d657461) { // meta full box
+            payload_start += 4;
+        }
+        if (payload_start < atom_end && (is_mp4_cover_container_atom(type) || type == 0x6d657461)) {
+            if (std::fseek(file, payload_start, SEEK_SET) != 0) {
+                return art;
+            }
+            art = scan_m4a_atoms_for_cover(file, atom_end, depth + 1);
+            if (art.kind != EmbeddedArtKind::None) {
+                return art;
+            }
+        }
+        if (std::fseek(file, atom_end, SEEK_SET) != 0) {
+            return art;
+        }
+    }
+}
+
+EmbeddedAlbumArt find_m4a_embedded_album_art(const std::string &path)
+{
+    EmbeddedAlbumArt art;
+    FILE *file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        return art;
+    }
+    if (std::fseek(file, 0, SEEK_END) == 0) {
+        const long end_pos = std::ftell(file);
+        if (end_pos > 0 && std::fseek(file, 0, SEEK_SET) == 0) {
+            art = scan_m4a_atoms_for_cover(file, end_pos, 0);
+        }
+    }
+    std::fclose(file);
+    return art;
+}
+
+EmbeddedAlbumArt find_embedded_album_art(const lofi::Track &track)
+{
+    if (track.format == "mp3") {
+        return find_mp3_embedded_album_art(track.path);
+    }
+    if (track.format == "m4a" || track.format == "aac") {
+        return find_m4a_embedded_album_art(track.path);
+    }
+    return {};
+}
+
+uint32_t fnv1a32(const std::string &value)
+{
+    uint32_t hash = 2166136261u;
+    for (unsigned char ch : value) {
+        hash ^= static_cast<uint32_t>(ch);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+std::string cover_cache_path_for(const lofi::Track &track)
+{
+    struct stat st = {};
+    uint32_t size_hash = 0;
+    uint32_t mtime_hash = 0;
+    if (stat(track.album_art_path.c_str(), &st) == 0) {
+        size_hash = static_cast<uint32_t>(st.st_size & 0xffffffffu);
+        mtime_hash = static_cast<uint32_t>(st.st_mtime & 0xffffffffu);
+    }
+    char identity[240] = {};
+    std::snprintf(identity,
+                  sizeof(identity),
+                  "%s:%lu:%lu:%d",
+                  track.album_art_path.c_str(),
+                  static_cast<unsigned long>(track.album_art_offset),
+                  static_cast<unsigned long>(track.album_art_size),
+                  track.album_art_embedded ? 1 : 0);
+    char path[160] = {};
+    std::snprintf(path,
+                  sizeof(path),
+                  "%s/%02dx%02d_%08lx_%08lx_%08lx.rgb565",
+                  kCoverCacheDir,
+                  kCoverThumbWidth,
+                  kCoverThumbHeight,
+                  static_cast<unsigned long>(fnv1a32(identity)),
+                  static_cast<unsigned long>(size_hash),
+                  static_cast<unsigned long>(mtime_hash));
+    return path;
+}
+
+std::string audio_cache_path_for(const lofi::Track &track)
+{
+    struct stat st = {};
+    uint32_t size_hash = 0;
+    uint32_t mtime_hash = 0;
+    if (stat(track.path.c_str(), &st) == 0) {
+        size_hash = static_cast<uint32_t>(st.st_size & 0xffffffffu);
+        mtime_hash = static_cast<uint32_t>(st.st_mtime & 0xffffffffu);
+    }
+    char identity[256] = {};
+    std::snprintf(identity,
+                  sizeof(identity),
+                  "%s:%lu:%lu",
+                  track.path.c_str(),
+                  static_cast<unsigned long>(size_hash),
+                  static_cast<unsigned long>(mtime_hash));
+    char path[160] = {};
+    std::snprintf(path,
+                  sizeof(path),
+                  "%s/%08lx_%08lx_%08lx.aac",
+                  kAudioCacheDir,
+                  static_cast<unsigned long>(fnv1a32(identity)),
+                  static_cast<unsigned long>(size_hash),
+                  static_cast<unsigned long>(mtime_hash));
+    return path;
+}
+
+std::string existing_audio_cache_path_for(const lofi::Track &track)
+{
+    if (track.format != "m4a") {
+        return "";
+    }
+    const std::string cache_path = audio_cache_path_for(track);
+    return file_exists(cache_path) ? cache_path : "";
+}
+
+bool build_audio_cache_for_track(const lofi::Track &track)
+{
+    if (track.format != "m4a" || !file_exists(track.path)) {
+        return false;
+    }
+    const std::string cache_path = audio_cache_path_for(track);
+    if (file_exists(cache_path)) {
+        return false;
+    }
+    lofi::M4aAacSummary summary;
+    std::string error;
+    const int64_t parse_start = esp_timer_get_time();
+    if (!lofi::inspect_m4a_aac_summary(track.path, summary, error)) {
+        ESP_LOGW(TAG, "AAC_CACHE index failed path=%s err=%s", track.path.c_str(), error.c_str());
+        return false;
+    }
+    if (summary.first_audio_offset < kSlowStartAudioOffsetThreshold) {
+        ESP_LOGI(TAG,
+                 "AAC_CACHE skip fast-start offset=%lu frames=%u path=%s",
+                 static_cast<unsigned long>(summary.first_audio_offset),
+                 static_cast<unsigned>(summary.frame_count),
+                 track.path.c_str());
+        return false;
+    }
+    if (!lofi::ensure_directory(kStateDir) || !lofi::ensure_directory(kAudioCacheDir)) {
+        ESP_LOGW(TAG, "AAC_CACHE mkdir failed");
+        return false;
+    }
+    const std::string temp_path = cache_path + ".tmp";
+    std::remove(temp_path.c_str());
+    const int64_t write_start = esp_timer_get_time();
+    if (!lofi::write_adts_aac_cache_from_m4a(track.path,
+                                             temp_path,
+                                             summary,
+                                             error,
+                                             audio_cache_cancel_requested,
+                                             nullptr)) {
+        std::remove(temp_path.c_str());
+        if (error == "cancelled") {
+            ESP_LOGI(TAG, "AAC_CACHE cancelled path=%s", track.path.c_str());
+        } else {
+            ESP_LOGW(TAG, "AAC_CACHE write failed path=%s err=%s", track.path.c_str(), error.c_str());
+        }
+        return false;
+    }
+    std::remove(cache_path.c_str());
+    if (std::rename(temp_path.c_str(), cache_path.c_str()) != 0) {
+        std::remove(temp_path.c_str());
+        ESP_LOGW(TAG, "AAC_CACHE rename failed cache=%s", cache_path.c_str());
+        return false;
+    }
+    const int64_t now = esp_timer_get_time();
+    ESP_LOGI(TAG,
+             "AAC_CACHE built offset=%lu frames=%u payload=%lu parse_ms=%lld write_ms=%lld cache=%s src=%s",
+             static_cast<unsigned long>(summary.first_audio_offset),
+             static_cast<unsigned>(summary.frame_count),
+             static_cast<unsigned long>(summary.audio_payload_bytes),
+             static_cast<long long>((write_start - parse_start) / 1000),
+             static_cast<long long>((now - write_start) / 1000),
+             cache_path.c_str(),
+             track.path.c_str());
+    return true;
+}
+
+void background_audio_cache_task(void *arg)
+{
+    AudioCacheTaskContext *context = static_cast<AudioCacheTaskContext *>(arg);
+    QueueHandle_t result_queue = context ? context->result_queue : nullptr;
+    lofi::Track track;
+    if (context) {
+        track = std::move(context->track);
+    }
+    delete context;
+
+    AudioCacheResult *result = new (std::nothrow) AudioCacheResult;
+    if (!result) {
+        ESP_LOGW(TAG, "AAC_CACHE result allocation failed");
+        if (result_queue) {
+            AudioCacheResult *empty_result = nullptr;
+            xQueueSend(result_queue, &empty_result, 0);
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+    result->attempted = true;
+    result->built = build_audio_cache_for_track(track);
+    if (!result_queue || xQueueSend(result_queue, &result, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "AAC_CACHE dropped result");
+        delete result;
+    }
+    vTaskDelete(nullptr);
+}
+
+QueueHandle_t start_background_audio_cache(const lofi::Track &track)
+{
+    QueueHandle_t result_queue = xQueueCreate(1, sizeof(AudioCacheResult *));
+    if (!result_queue) {
+        ESP_LOGW(TAG, "AAC_CACHE queue allocation failed");
+        return nullptr;
+    }
+    AudioCacheTaskContext *context = new (std::nothrow) AudioCacheTaskContext{track, result_queue};
+    if (!context) {
+        ESP_LOGW(TAG, "AAC_CACHE context allocation failed");
+        vQueueDelete(result_queue);
+        return nullptr;
+    }
+    g_audio_cache_cancel_requested = false;
+    if (xTaskCreatePinnedToCore(background_audio_cache_task,
+                                "aac_cache",
+                                8192,
+                                context,
+                                tskIDLE_PRIORITY + 1,
+                                nullptr,
+                                1) != pdPASS) {
+        ESP_LOGW(TAG, "AAC_CACHE task start failed");
+        delete context;
+        vQueueDelete(result_queue);
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "AAC_CACHE task started path=%s", track.path.c_str());
+    return result_queue;
+}
+
+bool start_next_audio_cache_candidate(const lofi::LibraryIndex &library, size_t &cursor, QueueHandle_t &result_queue)
+{
+    if (library.tracks.empty()) {
+        return false;
+    }
+    const size_t total = library.tracks.size();
+    for (size_t attempts = 0; attempts < total; ++attempts) {
+        const size_t index = cursor % total;
+        cursor = (cursor + 1) % total;
+        const lofi::Track &track = library.tracks[index];
+        if (track.format != "m4a" || !existing_audio_cache_path_for(track).empty()) {
+            continue;
+        }
+        if (!track.album_art_embedded || track.album_art_size < kSlowStartAudioOffsetThreshold) {
+            continue;
+        }
+        const size_t largest_free = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        if (largest_free < kAudioCacheMinLargestHeapBlock) {
+            ESP_LOGI(TAG,
+                     "AAC_CACHE defer low-heap largest=%u path=%s",
+                     static_cast<unsigned>(largest_free),
+                     track.path.c_str());
+            return false;
+        }
+        result_queue = start_background_audio_cache(track);
+        return result_queue != nullptr;
+    }
+    return false;
+}
+
+uint16_t cover_rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (uint16_t)(b >> 3);
+}
+
+struct CoverDecodeContext {
+    FILE *file = nullptr;
+    uint16_t *pixels = nullptr;
+    bool limited = false;
+    uint32_t remaining = 0;
+    int decoded_width = 0;
+    int decoded_height = 0;
+    int crop_x = 0;
+    int crop_y = 0;
+    int crop_size = 0;
+};
+
+UINT cover_jpeg_input(JDEC *decoder, BYTE *buffer, UINT requested)
+{
+    CoverDecodeContext *context = static_cast<CoverDecodeContext *>(decoder->device);
+    if (!context || !context->file) {
+        return 0;
+    }
+    if (context->limited) {
+        requested = std::min<UINT>(requested, context->remaining);
+    }
+    if (!buffer) {
+        if (std::fseek(context->file, requested, SEEK_CUR) != 0) {
+            return 0;
+        }
+        if (context->limited) {
+            context->remaining -= requested;
+        }
+        return requested;
+    }
+    const UINT got = static_cast<UINT>(std::fread(buffer, 1, requested, context->file));
+    if (context->limited) {
+        context->remaining -= got;
+    }
+    return got;
+}
+
+UINT cover_jpeg_output(JDEC *decoder, void *bitmap, JRECT *rect)
+{
+    CoverDecodeContext *context = static_cast<CoverDecodeContext *>(decoder->device);
+    if (!context || !context->pixels || !bitmap || !rect || context->crop_size <= 0) {
+        return 0;
+    }
+
+    const int block_width = static_cast<int>(rect->right - rect->left + 1);
+    const uint8_t *rgb = static_cast<const uint8_t *>(bitmap);
+    for (int y = rect->top; y <= rect->bottom; ++y) {
+        if (y < context->crop_y || y >= context->crop_y + context->crop_size) {
+            continue;
+        }
+        for (int x = rect->left; x <= rect->right; ++x) {
+            if (x < context->crop_x || x >= context->crop_x + context->crop_size) {
+                continue;
+            }
+            const int tx = (x - context->crop_x) * kCoverThumbWidth / context->crop_size;
+            const int ty = (y - context->crop_y) * kCoverThumbHeight / context->crop_size;
+            if (tx < 0 || tx >= kCoverThumbWidth || ty < 0 || ty >= kCoverThumbHeight) {
+                continue;
+            }
+            const int block_x = x - rect->left;
+            const int block_y = y - rect->top;
+            const uint8_t *src = rgb + (block_y * block_width + block_x) * 3;
+            context->pixels[ty * kCoverThumbWidth + tx] = cover_rgb565(src[0], src[1], src[2]);
+        }
+    }
+    return 1;
+}
+
+bool decode_jpeg_to_cover_cache(const lofi::Track &track, const std::string &cache_path)
+{
+    if (!lofi::ensure_directory(kStateDir) || !lofi::ensure_directory(kCoverCacheDir)) {
+        return false;
+    }
+
+    FILE *file = std::fopen(track.album_art_path.c_str(), "rb");
+    if (!file) {
+        ESP_LOGW(TAG, "COVER_DECODE open failed path=%s", track.album_art_path.c_str());
+        return false;
+    }
+    if (track.album_art_embedded &&
+        std::fseek(file, static_cast<long>(track.album_art_offset), SEEK_SET) != 0) {
+        std::fclose(file);
+        ESP_LOGW(TAG,
+                 "COVER_DECODE seek failed path=%s offset=%lu",
+                 track.album_art_path.c_str(),
+                 static_cast<unsigned long>(track.album_art_offset));
+        return false;
+    }
+
+    JDEC decoder = {};
+    CoverDecodeContext context;
+    context.file = file;
+    context.limited = track.album_art_embedded;
+    context.remaining = track.album_art_size;
+    uint8_t *work = static_cast<uint8_t *>(std::malloc(16 * 1024));
+    uint16_t *pixels = static_cast<uint16_t *>(std::malloc(kCoverThumbWidth * kCoverThumbHeight * sizeof(uint16_t)));
+    if (!work || !pixels) {
+        std::free(work);
+        std::free(pixels);
+        std::fclose(file);
+        ESP_LOGW(TAG, "COVER_DECODE allocation failed path=%s", track.album_art_path.c_str());
+        return false;
+    }
+    std::fill_n(pixels, kCoverThumbWidth * kCoverThumbHeight, cover_rgb565(20, 18, 24));
+    context.pixels = pixels;
+
+    JRESULT result = jd_prepare(&decoder, cover_jpeg_input, work, 16 * 1024, &context);
+    if (result == JDR_OK) {
+        BYTE scale = 0;
+        const UINT min_side = std::min(decoder.width, decoder.height);
+        while (scale < 3 && (min_side >> (scale + 1)) >= static_cast<UINT>(kCoverThumbWidth)) {
+            ++scale;
+        }
+        context.decoded_width = std::max<int>(1, (static_cast<int>(decoder.width) + (1 << scale) - 1) >> scale);
+        context.decoded_height = std::max<int>(1, (static_cast<int>(decoder.height) + (1 << scale) - 1) >> scale);
+        context.crop_size = std::min(context.decoded_width, context.decoded_height);
+        context.crop_x = (context.decoded_width - context.crop_size) / 2;
+        context.crop_y = (context.decoded_height - context.crop_size) / 2;
+        result = jd_decomp(&decoder, cover_jpeg_output, scale);
+    }
+    std::fclose(file);
+
+    bool ok = result == JDR_OK;
+    if (ok) {
+        FILE *out = std::fopen(cache_path.c_str(), "wb");
+        ok = out && std::fwrite(pixels, sizeof(uint16_t), kCoverThumbWidth * kCoverThumbHeight, out) ==
+                        static_cast<size_t>(kCoverThumbWidth * kCoverThumbHeight);
+        if (out) {
+            ok = std::fclose(out) == 0 && ok;
+        }
+    }
+
+    ESP_LOGI(TAG,
+             "COVER_DECODE result=%s code=%d src=%s cache=%s",
+             ok ? "ok" : "failed",
+             static_cast<int>(result),
+             track.album_art_path.c_str(),
+             cache_path.c_str());
+    std::free(work);
+    std::free(pixels);
+    return ok;
+}
+
+void populate_track_album_art_sources(lofi::LibraryIndex &library)
+{
+    size_t sidecar = 0;
+    size_t embedded_jpeg = 0;
+    size_t embedded_other = 0;
+    for (lofi::Track &track : library.tracks) {
+        track.album_art_path.clear();
+        track.album_art_cache_path.clear();
+        track.album_art_offset = 0;
+        track.album_art_size = 0;
+        track.album_art_embedded = false;
+
+        const EmbeddedAlbumArt embedded = find_embedded_album_art(track);
+        if (embedded.kind == EmbeddedArtKind::Jpeg) {
+            track.album_art_path = track.path;
+            track.album_art_offset = embedded.offset;
+            track.album_art_size = embedded.size;
+            track.album_art_embedded = true;
+            ++embedded_jpeg;
+            continue;
+        }
+        if (embedded.kind == EmbeddedArtKind::Other) {
+            ++embedded_other;
+        }
+
+        track.album_art_path = find_sidecar_album_art(track.path);
+        if (!track.album_art_path.empty()) {
+            ++sidecar;
+        }
+    }
+    ESP_LOGI(TAG,
+             "COVER_INDEX embedded_jpeg=%u embedded_other=%u sidecar=%u tracks=%u",
+             static_cast<unsigned>(embedded_jpeg),
+             static_cast<unsigned>(embedded_other),
+             static_cast<unsigned>(sidecar),
+             static_cast<unsigned>(library.tracks.size()));
+}
+
+bool ensure_track_album_art_cache(lofi::Track &track, bool allow_decode)
+{
+    if (track.album_art_path.empty()) {
+        return false;
+    }
+    if (!track.album_art_cache_path.empty() && file_exists(track.album_art_cache_path)) {
+        return false;
+    }
+
+    const std::string cache_path = cover_cache_path_for(track);
+    if (file_exists(cache_path)) {
+        const bool changed = track.album_art_cache_path != cache_path;
+        track.album_art_cache_path = cache_path;
+        return changed;
+    }
+    if (!allow_decode) {
+        return false;
+    }
+    if (decode_jpeg_to_cover_cache(track, cache_path)) {
+        track.album_art_cache_path = cache_path;
+        return true;
+    }
+
+    track.album_art_path.clear();
+    track.album_art_cache_path.clear();
+    track.album_art_offset = 0;
+    track.album_art_size = 0;
+    track.album_art_embedded = false;
+    return false;
+}
+
+bool ensure_current_album_art_cache(lofi::LibraryIndex &library, const lofi::PlaybackState &playback)
+{
+    const int current = lofi::queue_current_track(playback.queue);
+    if (current < 0 || static_cast<size_t>(current) >= library.tracks.size()) {
+        return false;
+    }
+    return ensure_track_album_art_cache(library.tracks[static_cast<size_t>(current)], !playback.playing);
 }
 
 void write_le16(FILE *file, uint16_t value)
@@ -750,7 +1600,7 @@ void log_i2c_probe_summary()
              esp_err_to_name(codec));
 }
 
-void sync_audio(const lofi::LibraryIndex &library, lofi::PlaybackState &playback, lofi::UiState &ui,
+void sync_audio(lofi::LibraryIndex &library, lofi::PlaybackState &playback, lofi::UiState &ui,
                 int &active_track, bool &audio_loaded, bool &last_playing, lofi::LofiProfile &active_profile,
                 int requested_seek_seconds)
 {
@@ -819,8 +1669,24 @@ void sync_audio(const lofi::LibraryIndex &library, lofi::PlaybackState &playback
     const int audio_volume = lofi::audio_volume_from_user_percent(playback.volume);
     lofi_audio::set_volume(audio_volume);
     if (!audio_loaded || active_track != current) {
-        const lofi::Track &track = library.tracks[static_cast<size_t>(current)];
-        esp_err_t err = lofi_audio::play_track(track, audio_volume, playback.lofi, playback.position_seconds);
+        lofi::Track &track = library.tracks[static_cast<size_t>(current)];
+        if (audio_loaded && active_track != current) {
+            lofi_audio::stop();
+            vTaskDelay(pdMS_TO_TICKS(60));
+            audio_loaded = false;
+            active_track = -1;
+        }
+        lofi_board::release_album_art_cache();
+        lofi_board::set_framebuffer_capture_enabled(false);
+        ensure_track_album_art_cache(track, false);
+        lofi::Track playback_track = track;
+        const std::string audio_cache_path = existing_audio_cache_path_for(track);
+        if (!audio_cache_path.empty()) {
+            playback_track.path = audio_cache_path;
+            playback_track.format = "aac";
+            ESP_LOGI(TAG, "AAC_CACHE use cache=%s src=%s", audio_cache_path.c_str(), track.path.c_str());
+        }
+        esp_err_t err = lofi_audio::play_track(playback_track, audio_volume, playback.lofi, playback.position_seconds);
         if (err == ESP_ERR_NOT_SUPPORTED) {
             playback.playing = false;
             audio_loaded = false;
@@ -889,11 +1755,8 @@ bool save_queue_snapshot_if_possible(bool sd_mounted,
 void rebuild_library(bool sd_mounted, lofi::LibraryIndex &library, lofi::PlaybackState &playback,
                      lofi::UiState &ui, bool resume_playing, bool show_toast)
 {
-    bool using_samples = false;
-    const std::vector<std::string> music_paths = scan_music_paths(sd_mounted, &using_samples);
-    library = lofi::build_library_index(music_paths);
-    populate_track_durations(library);
-    log_library_summary(library);
+    const LibraryScanResult scan = scan_library(sd_mounted);
+    library = scan.library;
 
     if (!playback.queue.track_indices.empty()) {
         lofi::PlaybackState restored = playback;
@@ -911,8 +1774,8 @@ void rebuild_library(bool sd_mounted, lofi::LibraryIndex &library, lofi::Playbac
     ui.scroll = 0;
     ui.back_stack.clear();
     ui.page = library.tracks.empty() ? lofi::Page::Empty : lofi::Page::LibraryHome;
-    if (show_toast || using_samples) {
-        ui.toast = using_samples ? "Using samples" : "Rescan done";
+    if (show_toast || scan.using_samples) {
+        ui.toast = scan.using_samples ? "Using samples" : "Rescan done";
     }
 }
 
@@ -972,6 +1835,212 @@ bool load_queue_snapshot_if_possible(bool sd_mounted, const lofi::LibraryIndex &
     return true;
 }
 
+size_t find_track_by_path(const lofi::LibraryIndex &library, const std::string &path)
+{
+    for (size_t i = 0; i < library.tracks.size(); ++i) {
+        if (library.tracks[i].path == path) {
+            return i;
+        }
+    }
+    return static_cast<size_t>(-1);
+}
+
+std::vector<std::string> queue_paths_for_library(const lofi::LibraryIndex &library, const lofi::Queue &queue)
+{
+    std::vector<std::string> paths;
+    paths.reserve(queue.track_indices.size());
+    for (size_t track_index : queue.track_indices) {
+        if (track_index < library.tracks.size()) {
+            paths.push_back(library.tracks[track_index].path);
+        }
+    }
+    return paths;
+}
+
+bool restore_selection_queue_by_paths(const lofi::LibraryIndex &library,
+                                      lofi::PlaybackState &playback,
+                                      const lofi::Queue &previous_queue,
+                                      const std::vector<std::string> &previous_paths,
+                                      const std::string &previous_current_path,
+                                      bool resume_playing)
+{
+    lofi::Queue restored = previous_queue;
+    restored.track_indices.clear();
+    size_t restored_current_index = 0;
+    bool found_current = false;
+
+    for (const std::string &path : previous_paths) {
+        const size_t track_index = find_track_by_path(library, path);
+        if (track_index == static_cast<size_t>(-1)) {
+            continue;
+        }
+        if (!previous_current_path.empty() && path == previous_current_path) {
+            restored_current_index = restored.track_indices.size();
+            found_current = true;
+        }
+        restored.track_indices.push_back(track_index);
+    }
+    if (restored.track_indices.empty()) {
+        return false;
+    }
+    if (found_current) {
+        restored.current_index = restored_current_index;
+    } else if (restored.current_index >= restored.track_indices.size()) {
+        restored.current_index = restored.track_indices.size() - 1;
+    }
+
+    playback.queue = restored;
+    playback.current_track = lofi::queue_current_track(playback.queue);
+    playback.playing = resume_playing && playback.current_track >= 0;
+    if (!found_current && !previous_current_path.empty()) {
+        playback.position_seconds = 0;
+    }
+    return playback.current_track >= 0;
+}
+
+void preserve_current_track_by_path(const lofi::LibraryIndex &library,
+                                    lofi::PlaybackState &playback,
+                                    const std::string &previous_path)
+{
+    if (previous_path.empty()) {
+        return;
+    }
+    const size_t track_index = find_track_by_path(library, previous_path);
+    if (track_index == static_cast<size_t>(-1)) {
+        return;
+    }
+    const auto it = std::find(playback.queue.track_indices.begin(),
+                              playback.queue.track_indices.end(),
+                              track_index);
+    if (it != playback.queue.track_indices.end()) {
+        playback.queue.current_index = static_cast<size_t>(it - playback.queue.track_indices.begin());
+    }
+    playback.current_track = static_cast<int>(track_index);
+}
+
+void apply_library_scan_result(LibraryScanResult *result,
+                               lofi::LibraryIndex &library,
+                               lofi::PlaybackState &playback,
+                               lofi::UiState &ui,
+                               int &active_track,
+                               bool &audio_loaded)
+{
+    if (!result) {
+        return;
+    }
+
+    const bool was_playing = playback.playing;
+    const lofi::Queue previous_queue = playback.queue;
+    const std::vector<std::string> previous_queue_paths = queue_paths_for_library(library, playback.queue);
+    std::string previous_path;
+    const int previous_current_track = lofi::queue_current_track(playback.queue);
+    if (previous_current_track >= 0 &&
+        static_cast<size_t>(previous_current_track) < library.tracks.size()) {
+        previous_path = library.tracks[static_cast<size_t>(previous_current_track)].path;
+    }
+
+    library = std::move(result->library);
+    if (!playback.queue.track_indices.empty()) {
+        bool restored_ok = false;
+        if (previous_queue.source_type == "selection") {
+            restored_ok = restore_selection_queue_by_paths(library,
+                                                           playback,
+                                                           previous_queue,
+                                                           previous_queue_paths,
+                                                           previous_path,
+                                                           was_playing);
+        } else {
+            lofi::PlaybackState restored = playback;
+            if (lofi::restore_playback_queue(library, restored, was_playing)) {
+                playback = restored;
+                preserve_current_track_by_path(library, playback, previous_path);
+                restored_ok = true;
+            }
+        }
+        if (!restored_ok) {
+            playback.queue = lofi::Queue{};
+            playback.current_track = -1;
+            playback.position_seconds = 0;
+            playback.playing = false;
+        }
+    }
+
+    if (active_track >= 0 && active_track != playback.current_track) {
+        audio_loaded = false;
+    }
+
+    if (ui.page == lofi::Page::Scan || (ui.page == lofi::Page::Empty && !library.tracks.empty())) {
+        ui.page = library.tracks.empty() ? lofi::Page::Empty : lofi::Page::LibraryHome;
+        ui.selected = 0;
+        ui.scroll = 0;
+        ui.back_stack.clear();
+    }
+    ui.toast = result->using_samples ? "Using samples" : "Library synced";
+    ESP_LOGI(TAG,
+             "LIBRARY_SYNC applied source=%s tracks=%u albums=%u artists=%u",
+             result->from_cache ? "cache" : "scan",
+             static_cast<unsigned>(library.tracks.size()),
+             static_cast<unsigned>(library.albums.size()),
+             static_cast<unsigned>(library.artists.size()));
+}
+
+void background_library_scan_task(void *arg)
+{
+    LibraryScanTaskContext *context = static_cast<LibraryScanTaskContext *>(arg);
+    QueueHandle_t result_queue = context ? context->result_queue : nullptr;
+    const bool sd_mounted = context && context->sd_mounted;
+    delete context;
+
+    LibraryScanResult *result = new (std::nothrow) LibraryScanResult(scan_library(sd_mounted));
+    if (!result) {
+        ESP_LOGW(TAG, "LIBRARY_SYNC failed to allocate result");
+        if (result_queue) {
+            LibraryScanResult *empty_result = nullptr;
+            xQueueSend(result_queue, &empty_result, 0);
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (!result_queue || xQueueSend(result_queue, &result, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "LIBRARY_SYNC dropped result");
+        delete result;
+    } else {
+        ESP_LOGI(TAG, "LIBRARY_SYNC ready tracks=%u", static_cast<unsigned>(result->library.tracks.size()));
+    }
+    vTaskDelete(nullptr);
+}
+
+QueueHandle_t start_background_library_scan(bool sd_mounted)
+{
+    if (!sd_mounted) {
+        return nullptr;
+    }
+    QueueHandle_t result_queue = xQueueCreate(1, sizeof(LibraryScanResult *));
+    if (!result_queue) {
+        ESP_LOGW(TAG, "LIBRARY_SYNC queue allocation failed");
+        return nullptr;
+    }
+    LibraryScanTaskContext *context = new (std::nothrow) LibraryScanTaskContext{sd_mounted, result_queue};
+    if (!context) {
+        ESP_LOGW(TAG, "LIBRARY_SYNC context allocation failed");
+        vQueueDelete(result_queue);
+        return nullptr;
+    }
+    if (xTaskCreate(background_library_scan_task,
+                    "library_scan",
+                    8192,
+                    context,
+                    tskIDLE_PRIORITY + 1,
+                    nullptr) != pdPASS) {
+        ESP_LOGW(TAG, "LIBRARY_SYNC task start failed");
+        delete context;
+        vQueueDelete(result_queue);
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "LIBRARY_SYNC started");
+    return result_queue;
+}
+
 } // namespace
 
 extern "C" void app_main(void)
@@ -1013,7 +2082,28 @@ extern "C" void app_main(void)
     }
 
     lofi::LibraryIndex library;
-    rebuild_library(sd_mounted, library, playback, ui, false, false);
+    bool cache_loaded = false;
+    bool start_background_scan = false;
+    const std::vector<std::string> cached_paths = load_cached_music_paths(sd_mounted, &cache_loaded);
+    if (cache_loaded && !cached_paths.empty()) {
+        LibraryScanResult cached = build_library_from_paths(cached_paths, false, true, false);
+        library = std::move(cached.library);
+        ui.page = library.tracks.empty() ? lofi::Page::Empty : lofi::Page::LibraryHome;
+        ui.toast = "Library cached";
+        start_background_scan = true;
+        ESP_LOGI(TAG, "LIBRARY_BOOT source=cache tracks=%u", static_cast<unsigned>(library.tracks.size()));
+    } else {
+        const LibraryScanResult scanned = scan_library(sd_mounted);
+        library = scanned.library;
+        ui.page = library.tracks.empty() ? lofi::Page::Empty : lofi::Page::LibraryHome;
+        if (scanned.using_samples) {
+            ui.toast = "Using samples";
+        }
+        ESP_LOGI(TAG,
+                 "LIBRARY_BOOT source=%s tracks=%u",
+                 scanned.using_samples ? "samples" : "scan",
+                 static_cast<unsigned>(library.tracks.size()));
+    }
 
     load_playback_state_if_possible(sd_mounted, library, playback, ui);
     load_queue_snapshot_if_possible(sd_mounted, library, playback, ui);
@@ -1037,12 +2127,20 @@ extern "C" void app_main(void)
     int active_track = -1;
     bool audio_loaded = false;
     bool last_playing = false;
+    bool library_scan_pending = start_background_scan;
+    QueueHandle_t library_scan_queue = nullptr;
+    QueueHandle_t audio_cache_queue = nullptr;
+    LibraryScanResult *deferred_library_scan_result = nullptr;
     lofi::LofiProfile active_profile;
     TickType_t last_redraw = xTaskGetTickCount();
     TickType_t last_state_save = xTaskGetTickCount();
     TickType_t last_status_log = xTaskGetTickCount();
     TickType_t last_keyboard_retry = xTaskGetTickCount();
     TickType_t last_user_activity = xTaskGetTickCount();
+    TickType_t last_audio_cache_attempt = xTaskGetTickCount();
+    size_t audio_cache_cursor = 0;
+    bool last_background_task_active = false;
+    uint8_t last_background_task_frame = 0;
     int last_saved_position = playback.position_seconds;
     bool state_saved = false;
     log_runtime_status(library, playback, ui, sd_mounted, state_saved);
@@ -1066,9 +2164,87 @@ extern "C" void app_main(void)
         bool frame_dump = false;
         bool wav_selftest = false;
         bool mp3_selftest = false;
+        const TickType_t now_ticks = xTaskGetTickCount();
+        const bool library_sync_idle = sd_mounted && !playback.playing && !audio_loaded &&
+                                       now_ticks - last_user_activity >= kLibrarySyncIdleDelay;
+        const bool audio_cache_idle = sd_mounted && !playback.playing && !audio_loaded &&
+                                      !library_scan_queue && !deferred_library_scan_result &&
+                                      now_ticks - last_user_activity >= kAudioCacheIdleDelay;
+        if (audio_cache_queue && !audio_cache_idle) {
+            g_audio_cache_cancel_requested = true;
+        }
+        if (library_scan_pending && !library_scan_queue && !deferred_library_scan_result && library_sync_idle) {
+            library_scan_queue = start_background_library_scan(sd_mounted);
+            library_scan_pending = library_scan_queue == nullptr;
+            if (library_scan_queue) {
+                ui.toast = "Syncing library";
+                needs_redraw = true;
+                needs_screen_log = true;
+            }
+        }
+        if (library_scan_queue) {
+            LibraryScanResult *scan_result = nullptr;
+            if (xQueueReceive(library_scan_queue, &scan_result, 0) == pdTRUE) {
+                vQueueDelete(library_scan_queue);
+                library_scan_queue = nullptr;
+                if (scan_result && library_sync_idle) {
+                    apply_library_scan_result(scan_result, library, playback, ui, active_track, audio_loaded);
+                    delete scan_result;
+                    save_queue_snapshot_if_possible(sd_mounted, library, playback);
+                    needs_redraw = true;
+                    needs_screen_log = true;
+                } else if (scan_result) {
+                    ESP_LOGI(TAG,
+                             "LIBRARY_SYNC defer apply playing=%d audio_loaded=%d",
+                             playback.playing ? 1 : 0,
+                             audio_loaded ? 1 : 0);
+                    deferred_library_scan_result = scan_result;
+                }
+            }
+        }
+        if (deferred_library_scan_result && library_sync_idle) {
+            apply_library_scan_result(deferred_library_scan_result, library, playback, ui, active_track, audio_loaded);
+            delete deferred_library_scan_result;
+            deferred_library_scan_result = nullptr;
+            save_queue_snapshot_if_possible(sd_mounted, library, playback);
+            needs_redraw = true;
+            needs_screen_log = true;
+        }
+        if (audio_cache_queue) {
+            AudioCacheResult *cache_result = nullptr;
+            if (xQueueReceive(audio_cache_queue, &cache_result, 0) == pdTRUE) {
+                vQueueDelete(audio_cache_queue);
+                audio_cache_queue = nullptr;
+                if (cache_result) {
+                    ESP_LOGI(TAG,
+                             "AAC_CACHE task complete attempted=%d built=%d",
+                             cache_result->attempted ? 1 : 0,
+                             cache_result->built ? 1 : 0);
+                    delete cache_result;
+                } else {
+                    ESP_LOGW(TAG, "AAC_CACHE task returned no result");
+                }
+            }
+        }
+        if (!audio_cache_queue && audio_cache_idle && now_ticks - last_audio_cache_attempt >= kAudioCacheAttemptInterval) {
+            start_next_audio_cache_candidate(library, audio_cache_cursor, audio_cache_queue);
+            last_audio_cache_attempt = xTaskGetTickCount();
+        }
+        const bool background_task_active = library_scan_queue || audio_cache_queue;
+        const uint8_t background_task_frame =
+            background_task_active ? static_cast<uint8_t>((xTaskGetTickCount() / pdMS_TO_TICKS(180)) % 4) : 0;
+        if (background_task_active != last_background_task_active) {
+            needs_redraw = true;
+            needs_screen_log = true;
+        } else if (background_task_active && background_task_frame != last_background_task_frame) {
+            needs_redraw = true;
+        }
         if (lofi_board::poll_action(action, &key_name) ||
             poll_serial_action(action, &key_name, frame_dump, wav_selftest, mp3_selftest)) {
             last_user_activity = xTaskGetTickCount();
+            if (audio_cache_queue) {
+                g_audio_cache_cancel_requested = true;
+            }
             const bool wake_only = display_err == ESP_OK && !lofi_board::screen_awake();
             if (wake_only) {
                 lofi_board::set_screen_awake(true);
@@ -1081,7 +2257,16 @@ extern "C" void app_main(void)
             if (wake_only) {
                 // First input after screen-off only wakes the display to avoid accidental actions.
             } else if (frame_dump) {
+                lofi_board::set_framebuffer_capture_enabled(true);
+                if (display_err == ESP_OK) {
+                    screen = lofi::render_screen(library, playback, ui);
+                    set_background_task_indicator(screen, background_task_active, xTaskGetTickCount());
+                    lofi_board::draw_screen(screen);
+                }
                 lofi_board::dump_framebuffer_to_serial();
+                if (playback.playing) {
+                    lofi_board::set_framebuffer_capture_enabled(false);
+                }
             } else if (wav_selftest || mp3_selftest) {
                 lofi_audio::stop();
                 audio_loaded = false;
@@ -1124,8 +2309,13 @@ extern "C" void app_main(void)
             needs_redraw = true;
             needs_screen_log = true;
         }
-        const bool animating_screen = ui.page == lofi::Page::NowPlaying || ui.page == lofi::Page::Queue ||
-                                      ui.page == lofi::Page::Songs || ui.page == lofi::Page::AlbumDetail;
+        if (ensure_current_album_art_cache(library, playback)) {
+            needs_redraw = true;
+            needs_screen_log = true;
+        }
+        const bool animating_screen = background_task_active || ui.page == lofi::Page::NowPlaying ||
+                                      ui.page == lofi::Page::Queue || ui.page == lofi::Page::Songs ||
+                                      ui.page == lofi::Page::AlbumDetail;
         const TickType_t redraw_interval = animating_screen ? pdMS_TO_TICKS(70)
                                                             : (playback.playing ? pdMS_TO_TICKS(250)
                                                                                 : pdMS_TO_TICKS(750));
@@ -1152,12 +2342,15 @@ extern "C" void app_main(void)
 
         if (needs_redraw) {
             screen = lofi::render_screen(library, playback, ui);
+            set_background_task_indicator(screen, background_task_active, xTaskGetTickCount());
             if (needs_screen_log) {
                 log_screen(screen);
             }
             if (display_err == ESP_OK) {
                 lofi_board::draw_screen(screen);
             }
+            last_background_task_active = screen.background_task_active;
+            last_background_task_frame = screen.background_task_frame;
             last_redraw = xTaskGetTickCount();
         }
         if (needs_state_save && save_playback_state_if_possible(sd_mounted, playback)) {

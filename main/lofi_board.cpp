@@ -63,7 +63,7 @@ char s_hold_key_name[12] = "-";
 TickType_t s_hold_started_tick = 0;
 TickType_t s_hold_last_emit_tick = 0;
 uint16_t s_hold_repeat_count = 0;
-uint16_t s_shadow_framebuffer[LCD_WIDTH * LCD_HEIGHT] = {};
+uint16_t *s_shadow_framebuffer = nullptr;
 bool s_shadow_framebuffer_valid = false;
 uint32_t s_framebuffer_dump_seq = 0;
 lv_display_t *s_lvgl_display = nullptr;
@@ -73,6 +73,11 @@ volatile bool s_lvgl_flush_pending = false;
 bool s_screen_awake = true;
 int s_screen_brightness_percent = 100;
 bool s_backlight_pwm_ready = false;
+uint16_t *s_album_art_pixels = nullptr;
+lv_image_dsc_t s_album_art_dsc = {};
+std::string s_album_art_cache_path;
+std::string s_album_art_failed_path;
+bool s_album_art_valid = false;
 
 constexpr ledc_mode_t kBacklightLedcMode = LEDC_LOW_SPEED_MODE;
 constexpr ledc_timer_t kBacklightLedcTimer = LEDC_TIMER_0;
@@ -99,6 +104,9 @@ MarqueeState s_queue_marquee;
 MarqueeState s_library_marquee;
 int s_home_last_selected = -1;
 std::string s_last_panel_page_title;
+
+constexpr int kAlbumArtWidth = 72;
+constexpr int kAlbumArtHeight = 72;
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -165,9 +173,13 @@ esp_err_t lcd_draw_solid(uint16_t color)
     }
     for (int y = 0; y < LCD_HEIGHT; ++y) {
         ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, y, LCD_WIDTH, y + 1, line), TAG, "draw line");
-        std::fill_n(&s_shadow_framebuffer[y * LCD_WIDTH], LCD_WIDTH, color);
+        if (s_shadow_framebuffer) {
+            std::fill_n(&s_shadow_framebuffer[y * LCD_WIDTH], LCD_WIDTH, color);
+        }
     }
-    s_shadow_framebuffer_valid = true;
+    if (s_shadow_framebuffer) {
+        s_shadow_framebuffer_valid = true;
+    }
     return ESP_OK;
 }
 
@@ -214,6 +226,9 @@ void unlock_i2c(void)
 uint32_t framebuffer_hash(void)
 {
     uint32_t hash = 2166136261u;
+    if (!s_shadow_framebuffer) {
+        return hash;
+    }
     for (size_t i = 0; i < LCD_WIDTH * LCD_HEIGHT; ++i) {
         const uint16_t word = s_shadow_framebuffer[i];
         hash ^= static_cast<uint8_t>(word & 0xff);
@@ -859,19 +874,21 @@ void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map
         lv_display_flush_ready(display);
     }
 
-    for (int32_t row = 0; row < height; ++row) {
-        const int32_t dst_y = area->y1 + row;
-        if (dst_y < 0 || dst_y >= LCD_HEIGHT) {
-            continue;
+    if (s_shadow_framebuffer) {
+        for (int32_t row = 0; row < height; ++row) {
+            const int32_t dst_y = area->y1 + row;
+            if (dst_y < 0 || dst_y >= LCD_HEIGHT) {
+                continue;
+            }
+            const int32_t src_x = x1 - area->x1;
+            const int32_t dst_x = x1;
+            const int32_t copy_width = x2 - x1 + 1;
+            const uint16_t *src = &pixels[row * width + src_x];
+            uint16_t *dst = &s_shadow_framebuffer[dst_y * LCD_WIDTH + dst_x];
+            std::copy_n(src, copy_width, dst);
         }
-        const int32_t src_x = x1 - area->x1;
-        const int32_t dst_x = x1;
-        const int32_t copy_width = x2 - x1 + 1;
-        const uint16_t *src = &pixels[row * width + src_x];
-        uint16_t *dst = &s_shadow_framebuffer[dst_y * LCD_WIDTH + dst_x];
-        std::copy_n(src, copy_width, dst);
+        s_shadow_framebuffer_valid = true;
     }
-    s_shadow_framebuffer_valid = true;
 }
 
 esp_err_t init_lvgl_display(void)
@@ -1058,6 +1075,21 @@ void draw_lvgl_battery(lv_obj_t *root, lv_color_t ink, lv_color_t dim, lv_color_
     lv_rect(root, x + 21, y + 4, 1, 2, ink);
 }
 
+void draw_lvgl_background_task_indicator(lv_obj_t *root, bool active, uint8_t frame, lv_color_t accent, lv_color_t dim)
+{
+    if (!active) {
+        return;
+    }
+    const int x = 63;
+    const int y = 8;
+    const uint8_t active_dot = frame % 4;
+    for (uint8_t i = 0; i < 4; ++i) {
+        const lv_color_t color = i == active_dot ? accent : dim;
+        const int dot_y = y + (i == active_dot ? -1 : 0);
+        lv_rect(root, x + i * 6, dot_y, 2, 2, color);
+    }
+}
+
 void draw_lvgl_header(lv_obj_t *root,
                       const std::string &title,
                       lv_color_t chrome,
@@ -1065,11 +1097,14 @@ void draw_lvgl_header(lv_obj_t *root,
                       lv_color_t ink,
                       lv_color_t dim,
                       lv_color_t line,
-                      lv_color_t battery)
+                      lv_color_t battery,
+                      bool background_task_active = false,
+                      uint8_t background_task_frame = 0)
 {
     lv_rect(root, 0, 0, LCD_WIDTH, 18, chrome);
     lv_rect(root, 0, 18, LCD_WIDTH, 1, line);
     lv_label(root, "LOFI", 4, 0, 54, accent, lv_font_header());
+    draw_lvgl_background_task_indicator(root, background_task_active, background_task_frame, accent, dim);
     lv_obj_t *page = lv_label(root, title, 103, 0, 106, ink, lv_font_header());
     lv_obj_set_style_text_align(page, LV_TEXT_ALIGN_RIGHT, 0);
     draw_lvgl_battery(root, ink, dim, battery);
@@ -1082,11 +1117,14 @@ void draw_lvgl_now_header(lv_obj_t *root,
                           lv_color_t ink,
                           lv_color_t dim,
                           lv_color_t line,
-                          lv_color_t battery)
+                          lv_color_t battery,
+                          bool background_task_active = false,
+                          uint8_t background_task_frame = 0)
 {
     lv_rect(root, 0, 0, LCD_WIDTH, 16, chrome);
     lv_rect(root, 0, 16, LCD_WIDTH, 1, line);
     lv_label(root, "LOFI", 4, 2, 48, accent, lv_font_now_chrome());
+    draw_lvgl_background_task_indicator(root, background_task_active, background_task_frame, accent, dim);
     lv_obj_t *page = lv_label(root, title, 111, 2, 98, ink, lv_font_now_chrome());
     lv_obj_set_style_text_align(page, LV_TEXT_ALIGN_RIGHT, 0);
     draw_lvgl_battery(root, ink, dim, battery);
@@ -1385,7 +1423,16 @@ esp_err_t draw_screen_lvgl_library_list(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, library_header_title(screen.title), chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root,
+                     library_header_title(screen.title),
+                     chrome,
+                     accent,
+                     ink,
+                     dim,
+                     line,
+                     accent,
+                     screen.background_task_active,
+                     screen.background_task_frame);
 
     draw_library_header_text(root, screen, ink, dim);
 
@@ -1835,7 +1882,7 @@ esp_err_t draw_screen_lvgl_home(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "HOME", chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root, "HOME", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
 
     constexpr int kBodyY = 19;
     constexpr int kStageHeight = 90;
@@ -1954,16 +2001,88 @@ void draw_lvgl_now_playing_footer(lv_obj_t *root,
     lv_obj_set_style_text_align(queue_plus, LV_TEXT_ALIGN_CENTER, 0);
 }
 
+bool load_album_art_cache(const std::string &path)
+{
+    if (path.empty()) {
+        release_album_art_cache();
+        return false;
+    }
+    if (s_album_art_valid && s_album_art_cache_path == path) {
+        return true;
+    }
+    if (s_album_art_failed_path == path) {
+        return false;
+    }
+
+    FILE *file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        release_album_art_cache();
+        s_album_art_failed_path = path;
+        ESP_LOGW(TAG, "COVER_DRAW open failed path=%s", path.c_str());
+        return false;
+    }
+    if (!s_album_art_pixels) {
+        s_album_art_pixels = static_cast<uint16_t *>(std::malloc(kAlbumArtWidth * kAlbumArtHeight * sizeof(uint16_t)));
+        if (!s_album_art_pixels) {
+            std::fclose(file);
+            s_album_art_valid = false;
+            s_album_art_failed_path = path;
+            ESP_LOGW(TAG, "COVER_DRAW allocation failed path=%s", path.c_str());
+            return false;
+        }
+    }
+    const size_t expected = kAlbumArtWidth * kAlbumArtHeight;
+    const size_t read = std::fread(s_album_art_pixels, sizeof(uint16_t), expected, file);
+    const bool ok = std::fclose(file) == 0 && read == expected;
+    if (!ok) {
+        release_album_art_cache();
+        s_album_art_failed_path = path;
+        ESP_LOGW(TAG, "COVER_DRAW read failed path=%s pixels=%u", path.c_str(), static_cast<unsigned>(read));
+        return false;
+    }
+
+    s_album_art_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    s_album_art_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    s_album_art_dsc.header.flags = 0;
+    s_album_art_dsc.header.w = kAlbumArtWidth;
+    s_album_art_dsc.header.h = kAlbumArtHeight;
+    s_album_art_dsc.header.stride = kAlbumArtWidth * sizeof(uint16_t);
+    s_album_art_dsc.data_size = expected * sizeof(uint16_t);
+    s_album_art_dsc.data = reinterpret_cast<const uint8_t *>(s_album_art_pixels);
+    s_album_art_cache_path = path;
+    s_album_art_failed_path.clear();
+    s_album_art_valid = true;
+    ESP_LOGI(TAG,
+             "COVER_DRAW loaded path=%s bytes=%u",
+             path.c_str(),
+             static_cast<unsigned>(expected * sizeof(uint16_t)));
+    return true;
+}
+
 void draw_lvgl_album_art(lv_obj_t *root,
                          lv_color_t panel,
                          lv_color_t bg,
                          lv_color_t accent,
                          lv_color_t teal,
                          lv_color_t dim,
-                         lv_color_t line)
+                         lv_color_t line,
+                         const std::string &cache_path)
 {
-    lv_obj_t *album = lv_rect(root, 10, 23, 76, 78, panel, 1, teal, 1);
-    lv_rect(album, 3, 3, 70, 72, bg);
+    constexpr int art_area_w = 72;
+    constexpr int art_area_h = 72;
+    constexpr int art_inset_x = 5;
+    constexpr int art_inset_y = 5;
+    lv_obj_t *album = lv_rect(root, 7, 21, 82, 82, panel, 1, teal, 1);
+    lv_rect(album, art_inset_x, art_inset_y, art_area_w, art_area_h, bg);
+    if (load_album_art_cache(cache_path)) {
+        lv_obj_t *image = lv_image_create(album);
+        lv_image_set_src(image, &s_album_art_dsc);
+        lv_obj_set_pos(image,
+                       art_inset_x + (art_area_w - kAlbumArtWidth) / 2 - 1,
+                       art_inset_y + (art_area_h - kAlbumArtHeight) / 2);
+        return;
+    }
+
     lv_rect(album, 50, 12, 4, 2, accent);
     lv_rect(album, 53, 14, 3, 3, accent);
     lv_rect(album, 55, 17, 2, 4, accent);
@@ -2022,8 +2141,8 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_now_header(root, "RECORDED", chrome, accent, ink, dim, line, accent);
-    draw_lvgl_album_art(root, panel, bg, accent, teal, dim, line);
+    draw_lvgl_now_header(root, "RECORDED", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
+    draw_lvgl_album_art(root, panel, bg, accent, teal, dim, line, screen.album_art_cache_path);
 
     const std::string title = !screen.rows.empty() ? screen.rows[0].left : "No track selected";
     const std::string artist = screen.rows.size() > 1 ? screen.rows[1].left : "Open Library to play";
@@ -2077,7 +2196,7 @@ esp_err_t draw_screen_lvgl_playback_menu(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "SETTINGS", chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root, "SETTINGS", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
 
     std::vector<PlaybackSettingItem> items;
     items.reserve(screen.rows.size());
@@ -2133,7 +2252,7 @@ esp_err_t draw_screen_lvgl_queue(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "QUEUE", chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root, "QUEUE", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
 
     const QueuePageInfo info = parse_queue_status(screen.status);
     if (info.total <= 0 || screen.rows.empty()) {
@@ -2205,7 +2324,7 @@ esp_err_t draw_screen_lvgl_lofi(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, "LO-FI", chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root, "LO-FI", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
     const bool edit_mode = screen.title == "Lo-Fi Edit";
     lv_label(root, edit_mode ? "EDIT" : "LO-FI", 10, 21, 86, ink, edit_mode ? lv_font_header() : lv_font_title());
     lv_obj_t *summary = lv_label(root, lofi_strength_summary(screen.status, screen.meta), 124, 24, 106, accent, lv_font_small());
@@ -2278,7 +2397,16 @@ esp_err_t draw_screen_lvgl_generic(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_header(root, library_header_title(screen.title), chrome, accent, ink, dim, line, accent);
+    draw_lvgl_header(root,
+                     library_header_title(screen.title),
+                     chrome,
+                     accent,
+                     ink,
+                     dim,
+                     line,
+                     accent,
+                     screen.background_task_active,
+                     screen.background_task_frame);
     lv_clipped_label(root, library_header_title(screen.title), 10, 23, 156, 21, -1, ink, lv_font_title());
     if (!screen.status.empty()) {
         lv_clipped_label(root,
@@ -2326,6 +2454,35 @@ esp_err_t draw_screen_lvgl_generic(const lofi::ScreenModel &screen)
 }
 
 } // namespace
+
+void release_album_art_cache(void)
+{
+    std::free(s_album_art_pixels);
+    s_album_art_pixels = nullptr;
+    s_album_art_dsc = {};
+    s_album_art_cache_path.clear();
+    s_album_art_valid = false;
+}
+
+void set_framebuffer_capture_enabled(bool enabled)
+{
+    if (!enabled) {
+        std::free(s_shadow_framebuffer);
+        s_shadow_framebuffer = nullptr;
+        s_shadow_framebuffer_valid = false;
+        return;
+    }
+    if (!s_shadow_framebuffer) {
+        s_shadow_framebuffer = static_cast<uint16_t *>(std::malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t)));
+        if (!s_shadow_framebuffer) {
+            ESP_LOGW(TAG, "FB shadow allocation failed bytes=%u",
+                     static_cast<unsigned>(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t)));
+            s_shadow_framebuffer_valid = false;
+            return;
+        }
+        s_shadow_framebuffer_valid = false;
+    }
+}
 
 esp_err_t init_display(void)
 {
@@ -2470,7 +2627,7 @@ void tick_display(void)
 
 void dump_framebuffer_to_serial(void)
 {
-    if (!s_shadow_framebuffer_valid) {
+    if (!s_shadow_framebuffer || !s_shadow_framebuffer_valid) {
         std::printf("FB_DUMP_ERROR reason=no_framebuffer\n");
         std::fflush(stdout);
         return;

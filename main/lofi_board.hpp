@@ -15,6 +15,8 @@ void set_screen_awake(bool awake);
 bool screen_awake(void);
 void tick_display(void);
 void dump_framebuffer_to_serial(void);
+void release_album_art_cache(void);
+void set_framebuffer_capture_enabled(bool enabled);
 
 struct KeyboardDiagnostics {
     bool ready = false;
