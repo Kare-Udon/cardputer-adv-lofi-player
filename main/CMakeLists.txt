@@ -21,6 +21,7 @@ idf_component_register(
         "lofi_audio.cpp"
         "lofi_board.cpp"
         "../src/lofi_core.cpp"
+        "../src/lofi_aac_cache.cpp"
         "../src/lofi_dsp.cpp"
         "../src/lofi_storage.cpp"
         "../src/lofi_wav.cpp"
