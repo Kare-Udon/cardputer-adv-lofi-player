@@ -1589,6 +1589,7 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
     screen.title = to_string(ui.page);
     screen.status = std::string("SD ") + (index.tracks.empty() ? "EMPTY" : "OK") + " | Vol " +
                     std::to_string(playback.volume) + " | LF " + to_string(playback.lofi.preset);
+    screen.volume_percent = playback.volume;
     if (ui.page == Page::LofiPresets || ui.page == Page::LofiEdit) {
         screen.meta = "Intensity " + std::to_string((std::max(0, std::min(100, playback.lofi.intensity)) + 5) / 10) +
                       "/10";
@@ -2698,6 +2699,9 @@ std::vector<std::string> screen_to_lines(const ScreenModel &screen)
     if (screen.background_task_active) {
         lines.push_back("background:" + std::to_string(screen.background_task_frame % 4));
     }
+    if (screen.volume_overlay_active) {
+        lines.push_back("volume_overlay:" + std::to_string(screen.volume_overlay_percent));
+    }
     for (const ScreenLine &row : screen.rows) {
         lines.push_back(row.right.empty() ? row.left : row.left + " | " + row.right);
     }
@@ -2731,6 +2735,7 @@ std::string screen_auto_snapshot(const ScreenModel &screen, uint32_t revision)
         << " cover=" << (screen.album_art_cache_path.empty() ? 0 : 1)
         << " bg=" << (screen.background_task_active ? 1 : 0)
         << " bg_frame=" << static_cast<unsigned>(screen.background_task_frame % 4)
+        << " volume_overlay=" << (screen.volume_overlay_active ? screen.volume_overlay_percent : -1)
         << " soft=\"" << screen.soft_left << "|" << screen.soft_center << "|" << screen.soft_right << "\"";
     return out.str();
 }

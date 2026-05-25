@@ -75,6 +75,12 @@ void set_background_task_indicator(lofi::ScreenModel &screen, bool active, TickT
     screen.background_task_frame = active ? static_cast<uint8_t>((now_ticks / pdMS_TO_TICKS(180)) % 4) : 0;
 }
 
+void set_volume_overlay(lofi::ScreenModel &screen, bool active, int volume_percent)
+{
+    screen.volume_overlay_active = active;
+    screen.volume_overlay_percent = std::max(0, std::min(100, volume_percent));
+}
+
 struct MediaFormatCounts {
     size_t mp3 = 0;
     size_t wav = 0;
@@ -2138,6 +2144,7 @@ extern "C" void app_main(void)
     TickType_t last_keyboard_retry = xTaskGetTickCount();
     TickType_t last_user_activity = xTaskGetTickCount();
     TickType_t last_audio_cache_attempt = xTaskGetTickCount();
+    TickType_t volume_overlay_until = 0;
     size_t audio_cache_cursor = 0;
     bool last_background_task_active = false;
     uint8_t last_background_task_frame = 0;
@@ -2261,6 +2268,10 @@ extern "C" void app_main(void)
                 if (display_err == ESP_OK) {
                     screen = lofi::render_screen(library, playback, ui);
                     set_background_task_indicator(screen, background_task_active, xTaskGetTickCount());
+                    set_volume_overlay(screen,
+                                       ui.page == lofi::Page::NowPlaying && volume_overlay_until != 0 &&
+                                           xTaskGetTickCount() < volume_overlay_until,
+                                       playback.volume);
                     lofi_board::draw_screen(screen);
                 }
                 lofi_board::dump_framebuffer_to_serial();
@@ -2291,6 +2302,10 @@ extern "C" void app_main(void)
                 lofi::apply_action(library, playback, ui, action);
                 if (action == lofi::Action::SeekForward || action == lofi::Action::SeekBackward) {
                     requested_seek_seconds = playback.position_seconds;
+                }
+                if (ui.page == lofi::Page::NowPlaying &&
+                    (action == lofi::Action::Up || action == lofi::Action::Down)) {
+                    volume_overlay_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
                 }
             }
             if (display_err == ESP_OK && previous_brightness != playback.brightness_percent) {
@@ -2325,6 +2340,12 @@ extern "C" void app_main(void)
         } else if (animating_screen && xTaskGetTickCount() - last_redraw > redraw_interval) {
             needs_redraw = true;
         }
+        if (ui.page == lofi::Page::NowPlaying && volume_overlay_until != 0 &&
+            xTaskGetTickCount() >= volume_overlay_until) {
+            volume_overlay_until = 0;
+            needs_redraw = true;
+            needs_screen_log = true;
+        }
         if (playback.position_seconds != last_saved_position &&
             xTaskGetTickCount() - last_state_save > (playback.playing ? pdMS_TO_TICKS(30000) : pdMS_TO_TICKS(5000))) {
             needs_state_save = true;
@@ -2343,6 +2364,10 @@ extern "C" void app_main(void)
         if (needs_redraw) {
             screen = lofi::render_screen(library, playback, ui);
             set_background_task_indicator(screen, background_task_active, xTaskGetTickCount());
+            set_volume_overlay(screen,
+                               ui.page == lofi::Page::NowPlaying && volume_overlay_until != 0 &&
+                                   xTaskGetTickCount() < volume_overlay_until,
+                               playback.volume);
             if (needs_screen_log) {
                 log_screen(screen);
             }

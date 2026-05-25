@@ -1,6 +1,7 @@
 #include "lofi_board.hpp"
 
 #include "board_pins.h"
+#include "lofi_volume_icons.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1967,7 +1968,65 @@ void draw_lvgl_footer_button(lv_obj_t *root,
     draw_lvgl_footer_button(root, 166, 120, 68, right, false, panel, active_fill, ink, line);
 }
 
+const char *const *volume_icon_rows_for_percent(int volume_percent)
+{
+    volume_percent = std::max(0, std::min(100, volume_percent));
+    if (volume_percent == 0) {
+        return volume_icons::kMuteRows;
+    }
+    if (volume_percent <= 30) {
+        return volume_icons::kLowRows;
+    }
+    if (volume_percent < 60) {
+        return volume_icons::kMediumRows;
+    }
+    return volume_icons::kHighRows;
+}
+
+void draw_lvgl_bitmap_rows(lv_obj_t *root,
+                           const char *const *rows,
+                           int width,
+                           int height,
+                           int x,
+                           int y,
+                           lv_color_t color,
+                           lv_color_t background)
+{
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const char level = rows[row][col];
+            if (level != '.') {
+                uint8_t opacity = 255;
+                if (level == ':') {
+                    opacity = 88;
+                } else if (level == '+') {
+                    opacity = 168;
+                }
+                lv_rect(root, x + col, y + row, 1, 1, lv_color_mix(color, background, opacity));
+            }
+        }
+    }
+}
+
+void draw_lvgl_volume_status_icon(lv_obj_t *root,
+                                  int x,
+                                  int y,
+                                  int volume_percent,
+                                  lv_color_t color,
+                                  lv_color_t background)
+{
+    draw_lvgl_bitmap_rows(root,
+                          volume_icon_rows_for_percent(volume_percent),
+                          volume_icons::kWidth,
+                          volume_icons::kHeight,
+                          x,
+                          y,
+                          color,
+                          background);
+}
+
 void draw_lvgl_now_playing_footer(lv_obj_t *root,
+                                  int volume_percent,
                                   lv_color_t chrome,
                                   lv_color_t accent,
                                   lv_color_t teal,
@@ -1983,8 +2042,7 @@ void draw_lvgl_now_playing_footer(lv_obj_t *root,
     lv_label(root, "MENU", 36, 123, 42, ink, lv_font_now_chrome());
 
     lv_rect(root, 104, 123, 1, 9, line);
-    lv_obj_t *volume = lv_label(root, LV_SYMBOL_VOLUME_MID, 111, 121, 20, teal, lv_font_symbol_small());
-    lv_obj_set_style_text_align(volume, LV_TEXT_ALIGN_CENTER, 0);
+    draw_lvgl_volume_status_icon(root, 112, 122, volume_percent, teal, chrome);
 
     lv_rect(root, 138, 123, 1, 9, line);
     lv_obj_t *repeat = lv_label(root, LV_SYMBOL_LOOP, 144, 121, 22, accent, lv_font_symbol_small());
@@ -1999,6 +2057,40 @@ void draw_lvgl_now_playing_footer(lv_obj_t *root,
     lv_obj_set_style_text_align(queue, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_t *queue_plus = lv_label(root, LV_SYMBOL_PLUS, 230, 123, 8, ink, lv_font_symbol_small());
     lv_obj_set_style_text_align(queue_plus, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+void draw_lvgl_volume_overlay(lv_obj_t *root,
+                              int volume_percent,
+                              lv_color_t bg,
+                              lv_color_t panel,
+                              lv_color_t accent,
+                              lv_color_t teal,
+                              lv_color_t ink,
+                              lv_color_t dim,
+                              lv_color_t line)
+{
+    volume_percent = std::max(0, std::min(100, volume_percent));
+    constexpr int w = 142;
+    constexpr int h = 52;
+    constexpr int x = (240 - w) / 2;
+    constexpr int y = (135 - h) / 2;
+    lv_obj_t *box = lv_rect(root, x, y, w, h, panel, 3, accent, 1);
+    lv_rect(box, 3, 3, w - 6, h - 6, bg, 2, line, 1);
+
+    draw_lvgl_volume_status_icon(box, 11, 8, volume_percent, teal, bg);
+    lv_label(box, "VOLUME", 36, 6, 55, dim, lv_font_small());
+    lv_obj_t *value = lv_label(box, std::to_string(volume_percent) + "%", 82, 4, 46, ink, lv_font_now_title());
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+
+    lv_rect(box, 10, 34, 118, 7, lv_rgb(31, 28, 37), 0, line, 1);
+    const int fill = std::max(0, std::min(116, 116 * volume_percent / 100));
+    if (fill > 0) {
+        lv_rect(box, 11, 36, fill, 3, volume_percent > 80 ? accent : teal);
+    }
+    for (int i = 0; i <= 4; ++i) {
+        const int tx = 11 + i * 29;
+        lv_rect(box, tx, 42, 1, 2, i * 25 <= volume_percent ? accent : line);
+    }
 }
 
 bool load_album_art_cache(const std::string &path)
@@ -2168,7 +2260,10 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
         lv_rect(root, 98, 111, progress_value - 3, 2, accent);
     }
 
-    draw_lvgl_now_playing_footer(root, chrome, accent, teal, ink, dim, line);
+    draw_lvgl_now_playing_footer(root, screen.volume_percent, chrome, accent, teal, ink, dim, line);
+    if (screen.volume_overlay_active) {
+        draw_lvgl_volume_overlay(root, screen.volume_overlay_percent, bg, panel, accent, teal, ink, dim, line);
+    }
     lv_refr_now(s_lvgl_display);
     return ESP_OK;
 }

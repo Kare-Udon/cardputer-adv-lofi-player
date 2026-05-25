@@ -205,8 +205,11 @@ struct ScreenModel {
     std::string album_art_cache_path;
     int position_seconds = 0;
     int duration_seconds = 0;
+    int volume_percent = 0;
     bool background_task_active = false;
     uint8_t background_task_frame = 0;
+    bool volume_overlay_active = false;
+    int volume_overlay_percent = 0;
 };
 
 bool is_audio_path(const std::string &path);
