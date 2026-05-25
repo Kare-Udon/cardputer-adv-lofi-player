@@ -1503,6 +1503,10 @@ bool poll_serial_action(lofi::Action &action,
             action = lofi::Action::Home;
             *name = "SERIAL_HOME";
             return true;
+        case '?':
+            action = lofi::Action::Help;
+            *name = "SERIAL_HELP";
+            return true;
         case 'g':
         case 'G':
             action = lofi::Action::Scan;

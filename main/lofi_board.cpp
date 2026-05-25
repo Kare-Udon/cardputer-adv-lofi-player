@@ -590,6 +590,9 @@ lofi::Action keyboard_action_from_key(uint8_t row, uint8_t col)
     if ((row == 2 && col == 4) || (row == 3 && col == 12)) {
         return lofi::Action::Right;
     }
+    if (row == 2 && col == 7) {
+        return lofi::Action::Help;
+    }
     if (row == 1 && col == 4) {
         return lofi::Action::Repeat;
     }
@@ -2471,6 +2474,78 @@ esp_err_t draw_screen_lvgl_lofi(const lofi::ScreenModel &screen)
     return ESP_OK;
 }
 
+void draw_help_keyboard_icon(lv_obj_t *root, int x, int y, lv_color_t teal, lv_color_t accent, lv_color_t line)
+{
+    lv_rect(root, x, y + 2, 23, 13, lv_color_make(20, 18, 24), 2, teal, 1);
+    for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            const lv_color_t color = (row == 0 && col == 0) ? accent : line;
+            lv_rect(root, x + 4 + col * 4, y + 5 + row * 4, 2, 2, color);
+        }
+    }
+    lv_rect(root, x + 8, y + 13, 9, 1, teal);
+}
+
+esp_err_t draw_screen_lvgl_help(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(20, 18, 24);
+    const lv_color_t chrome = lv_rgb(13, 12, 16);
+    const lv_color_t accent = lv_rgb(245, 174, 94);
+    const lv_color_t teal = lv_rgb(125, 205, 205);
+    const lv_color_t ink = lv_rgb(248, 233, 207);
+    const lv_color_t dim = lv_rgb(162, 152, 138);
+    const lv_color_t line = lv_rgb(69, 60, 71);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_lvgl_header(root,
+                     "HELP",
+                     chrome,
+                     accent,
+                     ink,
+                     dim,
+                     line,
+                     accent,
+                     screen.background_task_active,
+                     screen.background_task_frame);
+
+    draw_help_keyboard_icon(root, 10, 23, teal, accent, line);
+    lv_clipped_label(root, screen.subtitle, 40, 22, 132, 19, -1, ink, lv_font_normal());
+    lv_obj_t *page = lv_label(root, screen.meta, 196, 24, 34, dim, lv_font_small());
+    lv_obj_set_style_text_align(page, LV_TEXT_ALIGN_RIGHT, 0);
+
+    constexpr int row_x = 9;
+    constexpr int row_y = 43;
+    constexpr int row_h = 15;
+    constexpr int row_step = 15;
+    for (size_t i = 0; i < screen.rows.size() && i < 5; ++i) {
+        const int y = row_y + static_cast<int>(i) * row_step;
+        lv_rect(root, row_x, y + row_h - 1, 222, 1, line);
+        lv_rect(root, row_x, y, 48, 13, bg, 2, accent, 1);
+        lv_obj_t *key = lv_label(root, screen.rows[i].left, row_x + 2, y - 3, 44, accent, lv_font_small());
+        lv_obj_set_style_text_align(key, LV_TEXT_ALIGN_CENTER, 0);
+        lv_clipped_label(root, screen.rows[i].right, 64, y - 1, 158, 15, -1, ink, lv_font_small());
+    }
+
+    lv_rect(root, 0, 119, LCD_WIDTH, 1, line);
+    lv_label(root, "H CLOSE", 9, 121, 58, teal, lv_font_tiny());
+    lv_obj_t *scroll = lv_label(root, screen.soft_center, 75, 121, 90, dim, lv_font_tiny());
+    lv_obj_set_style_text_align(scroll, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *index = lv_label(root, screen.meta, 194, 121, 36, accent, lv_font_tiny());
+    lv_obj_set_style_text_align(index, LV_TEXT_ALIGN_RIGHT, 0);
+
+    lv_refr_now(s_lvgl_display);
+    return ESP_OK;
+}
+
 esp_err_t draw_screen_lvgl_generic(const lofi::ScreenModel &screen)
 {
     if (!s_lvgl_display) {
@@ -2673,6 +2748,10 @@ esp_err_t draw_screen(const lofi::ScreenModel &screen)
         return ESP_ERR_INVALID_STATE;
     }
     const uint16_t lvgl_bg = lcd_color565(20, 18, 24);
+    if (screen.title == "Help" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "help preclear");
+        return draw_screen_lvgl_help(screen);
+    }
     if (screen.title == "Now Playing" && s_lvgl_display) {
         ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "now preclear");
         return draw_screen_lvgl_now_playing(screen);

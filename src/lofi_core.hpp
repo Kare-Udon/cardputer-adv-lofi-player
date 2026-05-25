@@ -64,6 +64,7 @@ enum class Action {
     Menu,
     Home,
     Scan,
+    Help,
 };
 
 struct Track {
@@ -186,6 +187,9 @@ struct UiState {
     std::vector<size_t> action_tracks;
     std::vector<UiNavEntry> back_stack;
     bool volume_boost_warning_armed = false;
+    bool help_active = false;
+    Page help_page = Page::LibraryHome;
+    size_t help_page_index = 0;
 };
 
 struct ScreenLine {

@@ -784,6 +784,9 @@ void reset_to_home(UiState &ui)
     ui.action_tracks.clear();
     ui.action_label.clear();
     ui.back_stack.clear();
+    ui.help_active = false;
+    ui.help_page = Page::LibraryHome;
+    ui.help_page_index = 0;
 }
 
 void begin_library_action(UiState &ui,
@@ -798,6 +801,230 @@ void begin_library_action(UiState &ui,
     navigate_to(ui, Page::LibraryAction);
     ui.selected = 0;
     ui.scroll = 0;
+}
+
+struct HelpEntry {
+    const char *key;
+    const char *action;
+};
+
+std::string help_title(Page page)
+{
+    switch (page) {
+    case Page::NowPlaying:
+        return "NOW PLAYING";
+    case Page::LibraryHome:
+        return "HOME";
+    case Page::LibraryRoot:
+        return "LIBRARY";
+    case Page::ArtistAlbums:
+        return "ARTIST";
+    case Page::AlbumDetail:
+        return "ALBUM";
+    case Page::Folder:
+        return "FOLDERS";
+    case Page::FolderDetail:
+        return "FOLDER";
+    case Page::PlaylistDetail:
+        return "PLAYLIST";
+    case Page::LofiPresets:
+        return "LOFI";
+    case Page::LofiEdit:
+        return "LOFI EDIT";
+    case Page::PlaybackMenu:
+        return "SETTINGS";
+    case Page::LibraryAction:
+        return "ACTION MENU";
+    default: {
+        std::string out = to_string(page);
+        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::toupper(ch));
+        });
+        return out;
+    }
+    }
+}
+
+std::vector<HelpEntry> help_entries_for_page(Page page)
+{
+    switch (page) {
+    case Page::NowPlaying:
+        return {{"SPACE", "Play / pause"},
+                {"LEFT", "Previous track"},
+                {"RIGHT", "Next track"},
+                {"UP", "Volume up"},
+                {"DOWN", "Volume down"},
+                {"M", "Open settings"},
+                {"L", "Lo-Fi presets"},
+                {"R", "Repeat mode"},
+                {"S", "Shuffle queue"},
+                {"DEL", "Back to home"}};
+    case Page::LibraryHome:
+        return {{"LEFT", "Previous card"},
+                {"RIGHT", "Next card"},
+                {"UP", "Previous card"},
+                {"DOWN", "Next card"},
+                {"ENTER", "Open selected"},
+                {"M", "Open settings"}};
+    case Page::LibraryRoot:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open section"},
+                {"RIGHT", "Open section"},
+                {"M", "Queue all library"},
+                {"DEL", "Back to home"}};
+    case Page::Songs:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Play selected"},
+                {"S", "Select track"},
+                {"M", "Actions for selection"},
+                {"RIGHT", "Play selected"},
+                {"DEL", "Back to library"}};
+    case Page::Albums:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open album"},
+                {"RIGHT", "Open album"},
+                {"SPACE", "Play album"},
+                {"M", "Album actions"},
+                {"DEL", "Back to library"}};
+    case Page::AlbumDetail:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Play row"},
+                {"SPACE", "Play row"},
+                {"S", "Select track"},
+                {"M", "Actions for tracks"},
+                {"RIGHT", "Actions for tracks"},
+                {"DEL", "Back"}};
+    case Page::Artists:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open artist"},
+                {"RIGHT", "Open artist"},
+                {"SPACE", "Play artist"},
+                {"M", "Play artist"},
+                {"DEL", "Back to library"}};
+    case Page::ArtistAlbums:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open row"},
+                {"RIGHT", "Open row"},
+                {"SPACE", "Artist actions"},
+                {"M", "Artist actions"},
+                {"DEL", "Back to artists"}};
+    case Page::LibraryAction:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Confirm action"},
+                {"RIGHT", "Confirm action"},
+                {"SPACE", "Confirm action"},
+                {"DEL", "Cancel"}};
+    case Page::Folder:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open folder"},
+                {"RIGHT", "Open folder"},
+                {"SPACE", "Play folder"},
+                {"M", "Folder actions"},
+                {"DEL", "Back to library"}};
+    case Page::FolderDetail:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Play row"},
+                {"SPACE", "Play row"},
+                {"S", "Select track"},
+                {"M", "Actions for tracks"},
+                {"DEL", "Back to folders"}};
+    case Page::Playlists:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Open playlist"},
+                {"RIGHT", "Open playlist"},
+                {"SPACE", "Play playlist"},
+                {"M", "Playlist actions"},
+                {"DEL", "Back to library"}};
+    case Page::PlaylistDetail:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"ENTER", "Play row"},
+                {"SPACE", "Play row"},
+                {"S", "Select track"},
+                {"M", "Actions for tracks"},
+                {"DEL", "Back to playlists"}};
+    case Page::LofiPresets:
+        return {{"UP", "Previous preset"},
+                {"DOWN", "Next preset"},
+                {"ENTER", "Apply preset"},
+                {"LEFT", "Turn Lo-Fi off"},
+                {"RIGHT", "Edit parameters"},
+                {"M", "Edit parameters"},
+                {"DEL", "Back"}};
+    case Page::LofiEdit:
+        return {{"UP", "Previous control"},
+                {"DOWN", "Next control"},
+                {"LEFT", "Decrease value"},
+                {"RIGHT", "Increase value"},
+                {"ENTER", "Save values"},
+                {"DEL", "Back to presets"}};
+    case Page::PlaybackMenu:
+        return {{"UP", "Previous setting"},
+                {"DOWN", "Next setting"},
+                {"LEFT", "Decrease / previous"},
+                {"RIGHT", "Increase / next"},
+                {"ENTER", "Toggle / adjust"},
+                {"L", "Lo-Fi presets"},
+                {"DEL", "Back"}};
+    case Page::Queue:
+        return {{"UP", "Move up"},
+                {"DOWN", "Move down"},
+                {"LEFT", "Page up"},
+                {"RIGHT", "Page down"},
+                {"ENTER", "Play selected"},
+                {"SPACE", "Play selected"},
+                {"DEL", "Back to player"}};
+    case Page::Scan:
+        return {{"ENTER", "Hide scan screen"},
+                {"RIGHT", "Hide scan screen"},
+                {"DEL", "Back to home"},
+                {"H", "Close help"}};
+    case Page::Empty:
+    default:
+        return {{"ENTER", "Open scan"},
+                {"SPACE", "Open scan"},
+                {"M", "Open scan"},
+                {"RIGHT", "Open folders"},
+                {"DEL", "Back to home"}};
+    }
+}
+
+constexpr size_t kHelpRowsPerPage = 5;
+
+size_t help_page_count(Page page)
+{
+    const size_t count = help_entries_for_page(page).size();
+    return std::max<size_t>(1, (count + kHelpRowsPerPage - 1) / kHelpRowsPerPage);
+}
+
+void render_help_screen(ScreenModel &screen, const UiState &ui)
+{
+    const std::vector<HelpEntry> entries = help_entries_for_page(ui.help_page);
+    const size_t page_count = std::max<size_t>(1, (entries.size() + kHelpRowsPerPage - 1) / kHelpRowsPerPage);
+    const size_t page_index = std::min(ui.help_page_index, page_count - 1);
+    const size_t start = page_index * kHelpRowsPerPage;
+    const size_t end = std::min(entries.size(), start + kHelpRowsPerPage);
+
+    screen.title = "Help";
+    screen.subtitle = help_title(ui.help_page);
+    screen.meta = std::to_string(page_index + 1) + "/" + std::to_string(page_count);
+    screen.status = "HELP " + screen.subtitle;
+    screen.soft_left = "H Close";
+    screen.soft_center = page_count > 1 ? "Up/Down Page" : "";
+    screen.soft_right = screen.meta;
+    for (size_t i = start; i < end; ++i) {
+        screen.rows.push_back({entries[i].key, entries[i].action});
+    }
 }
 
 } // namespace
@@ -1597,6 +1824,10 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
     screen.soft_left = "Back";
     screen.soft_center = "OK";
     screen.soft_right = "Menu";
+    if (ui.help_active) {
+        render_help_screen(screen, ui);
+        return screen;
+    }
 
     const int current = queue_current_track(playback.queue);
     if (ui.page == Page::NowPlaying) {
@@ -2071,8 +2302,31 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
     };
 
     ui.toast.clear();
+    if (action == Action::Help) {
+        if (ui.help_active) {
+            ui.help_active = false;
+        } else {
+            ui.help_active = true;
+            ui.help_page = ui.page;
+            ui.help_page_index = 0;
+        }
+        return;
+    }
     if (action == Action::Home) {
+        ui.help_active = false;
         reset_to_home(ui);
+        return;
+    }
+    if (ui.help_active) {
+        const size_t count = help_page_count(ui.help_page);
+        if (action == Action::Back || action == Action::Menu || action == Action::Ok ||
+            action == Action::PlayPause) {
+            ui.help_active = false;
+        } else if (action == Action::Down || action == Action::Right) {
+            ui.help_page_index = count == 0 ? 0 : (ui.help_page_index + 1) % count;
+        } else if (action == Action::Up || action == Action::Left) {
+            ui.help_page_index = count == 0 ? 0 : (ui.help_page_index == 0 ? count - 1 : ui.help_page_index - 1);
+        }
         return;
     }
     if (action == Action::Scan) {
