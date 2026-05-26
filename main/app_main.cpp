@@ -81,6 +81,18 @@ void set_volume_overlay(lofi::ScreenModel &screen, bool active, int volume_perce
     screen.volume_overlay_percent = std::max(0, std::min(100, volume_percent));
 }
 
+void set_mode_overlay(lofi::ScreenModel &screen,
+                      bool active,
+                      const std::string &kind,
+                      const std::string &title,
+                      const std::string &value)
+{
+    screen.mode_overlay_active = active;
+    screen.mode_overlay_kind = active ? kind : "";
+    screen.mode_overlay_title = active ? title : "";
+    screen.mode_overlay_value = active ? value : "";
+}
+
 struct MediaFormatCounts {
     size_t mp3 = 0;
     size_t wav = 0;
@@ -291,10 +303,12 @@ void populate_track_durations(lofi::LibraryIndex &library)
 {
     size_t known = 0;
     for (lofi::Track &track : library.tracks) {
-        if (track.format == "m4a" || track.format == "aac") {
-            track.duration_seconds = estimate_m4a_duration_seconds(track.path);
-        } else if (track.format == "wav") {
-            track.duration_seconds = estimate_wav_duration_seconds(track.path);
+        if (track.duration_seconds <= 0) {
+            if (track.format == "m4a" || track.format == "aac") {
+                track.duration_seconds = estimate_m4a_duration_seconds(track.path);
+            } else if (track.format == "wav") {
+                track.duration_seconds = estimate_wav_duration_seconds(track.path);
+            }
         }
         if (track.duration_seconds > 0) {
             ++known;
@@ -303,6 +317,26 @@ void populate_track_durations(lofi::LibraryIndex &library)
     ESP_LOGI(TAG, "DURATION_INDEX known=%u total=%u",
              static_cast<unsigned>(known),
              static_cast<unsigned>(library.tracks.size()));
+}
+
+bool ensure_track_duration(lofi::Track &track)
+{
+    if (track.duration_seconds > 0) {
+        return false;
+    }
+    if (track.format == "m4a" || track.format == "aac") {
+        track.duration_seconds = estimate_m4a_duration_seconds(track.path);
+    } else if (track.format == "wav") {
+        track.duration_seconds = estimate_wav_duration_seconds(track.path);
+    }
+    if (track.duration_seconds <= 0) {
+        return false;
+    }
+    ESP_LOGI(TAG,
+             "DURATION_TRACK seconds=%d path=%s",
+             track.duration_seconds,
+             track.path.c_str());
+    return true;
 }
 
 std::vector<std::string> load_cached_music_paths(bool sd_mounted, bool *cache_loaded)
@@ -1190,6 +1224,15 @@ bool ensure_current_album_art_cache(lofi::LibraryIndex &library, const lofi::Pla
     return ensure_track_album_art_cache(library.tracks[static_cast<size_t>(current)], !playback.playing);
 }
 
+bool ensure_current_track_duration(lofi::LibraryIndex &library, const lofi::PlaybackState &playback)
+{
+    const int current = lofi::queue_current_track(playback.queue);
+    if (current < 0 || static_cast<size_t>(current) >= library.tracks.size()) {
+        return false;
+    }
+    return ensure_track_duration(library.tracks[static_cast<size_t>(current)]);
+}
+
 void write_le16(FILE *file, uint16_t value)
 {
     std::fputc(value & 0xff, file);
@@ -1688,7 +1731,8 @@ void sync_audio(lofi::LibraryIndex &library, lofi::PlaybackState &playback, lofi
         }
         lofi_board::release_album_art_cache();
         lofi_board::set_framebuffer_capture_enabled(false);
-        ensure_track_album_art_cache(track, false);
+        ensure_track_duration(track);
+        ensure_track_album_art_cache(track, true);
         lofi::Track playback_track = track;
         const std::string audio_cache_path = existing_audio_cache_path_for(track);
         if (!audio_cache_path.empty()) {
@@ -2149,6 +2193,10 @@ extern "C" void app_main(void)
     TickType_t last_user_activity = xTaskGetTickCount();
     TickType_t last_audio_cache_attempt = xTaskGetTickCount();
     TickType_t volume_overlay_until = 0;
+    TickType_t mode_overlay_until = 0;
+    std::string mode_overlay_kind;
+    std::string mode_overlay_title;
+    std::string mode_overlay_value;
     size_t audio_cache_cursor = 0;
     bool last_background_task_active = false;
     uint8_t last_background_task_frame = 0;
@@ -2276,6 +2324,12 @@ extern "C" void app_main(void)
                                        ui.page == lofi::Page::NowPlaying && volume_overlay_until != 0 &&
                                            xTaskGetTickCount() < volume_overlay_until,
                                        playback.volume);
+                    set_mode_overlay(screen,
+                                     ui.page == lofi::Page::NowPlaying && mode_overlay_until != 0 &&
+                                         xTaskGetTickCount() < mode_overlay_until,
+                                     mode_overlay_kind,
+                                     mode_overlay_title,
+                                     mode_overlay_value);
                     lofi_board::draw_screen(screen);
                 }
                 lofi_board::dump_framebuffer_to_serial();
@@ -2311,6 +2365,17 @@ extern "C" void app_main(void)
                     (action == lofi::Action::Up || action == lofi::Action::Down)) {
                     volume_overlay_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
                 }
+                if (ui.page == lofi::Page::NowPlaying && action == lofi::Action::Repeat) {
+                    mode_overlay_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+                    mode_overlay_kind = "repeat";
+                    mode_overlay_title = "REPEAT";
+                    mode_overlay_value = lofi::to_string(playback.repeat);
+                } else if (ui.page == lofi::Page::NowPlaying && action == lofi::Action::Shuffle) {
+                    mode_overlay_until = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+                    mode_overlay_kind = "shuffle";
+                    mode_overlay_title = "SHUFFLE";
+                    mode_overlay_value = playback.queue.shuffle ? "On" : "Off";
+                }
             }
             if (display_err == ESP_OK && previous_brightness != playback.brightness_percent) {
                 lofi_board::set_screen_brightness_percent(playback.brightness_percent);
@@ -2325,6 +2390,10 @@ extern "C" void app_main(void)
         const std::string previous_toast = ui.toast;
         sync_audio(library, playback, ui, active_track, audio_loaded, last_playing, active_profile, requested_seek_seconds);
         if (previous_playing != playback.playing || previous_toast != ui.toast) {
+            needs_redraw = true;
+            needs_screen_log = true;
+        }
+        if (ensure_current_track_duration(library, playback)) {
             needs_redraw = true;
             needs_screen_log = true;
         }
@@ -2350,6 +2419,11 @@ extern "C" void app_main(void)
             needs_redraw = true;
             needs_screen_log = true;
         }
+        if (mode_overlay_until != 0 && xTaskGetTickCount() >= mode_overlay_until) {
+            mode_overlay_until = 0;
+            needs_redraw = true;
+            needs_screen_log = true;
+        }
         if (playback.position_seconds != last_saved_position &&
             xTaskGetTickCount() - last_state_save > (playback.playing ? pdMS_TO_TICKS(30000) : pdMS_TO_TICKS(5000))) {
             needs_state_save = true;
@@ -2372,6 +2446,12 @@ extern "C" void app_main(void)
                                ui.page == lofi::Page::NowPlaying && volume_overlay_until != 0 &&
                                    xTaskGetTickCount() < volume_overlay_until,
                                playback.volume);
+            set_mode_overlay(screen,
+                             ui.page == lofi::Page::NowPlaying && mode_overlay_until != 0 &&
+                                 xTaskGetTickCount() < mode_overlay_until,
+                             mode_overlay_kind,
+                             mode_overlay_title,
+                             mode_overlay_value);
             if (needs_screen_log) {
                 log_screen(screen);
             }

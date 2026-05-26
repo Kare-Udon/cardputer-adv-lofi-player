@@ -488,6 +488,17 @@ constexpr size_t kLibraryRootVisibleRows = 5;
 constexpr size_t kLibraryListVisibleRows = 4;
 constexpr int kVolumeBoostThreshold = 80;
 
+bool lofi_profile_active(const LofiProfile &profile)
+{
+    return profile.preset != LofiPreset::Off &&
+           (std::max(0, std::min(100, profile.intensity)) > 0 ||
+            std::max(0, std::min(100, profile.warmth)) > 0 ||
+            std::max(0, std::min(100, profile.noise)) > 0 ||
+            std::max(0, std::min(100, profile.wobble)) > 0 ||
+            std::max(0, std::min(100, profile.space)) > 0 ||
+            std::max(0, std::min(100, profile.softness)) > 0);
+}
+
 int normalize_user_volume_percent(int percent)
 {
     return std::max(0, std::min(100, percent));
@@ -1326,7 +1337,7 @@ int queue_next(Queue &queue, RepeatMode repeat)
         ++queue.current_index;
         return queue_current_track(queue);
     }
-    if (repeat == RepeatMode::Album || repeat == RepeatMode::All) {
+    if (repeat == RepeatMode::List) {
         queue.current_index = 0;
         return queue_current_track(queue);
     }
@@ -1430,10 +1441,8 @@ const char *to_string(RepeatMode repeat)
     switch (repeat) {
     case RepeatMode::One:
         return "One";
-    case RepeatMode::Album:
-        return "Album";
-    case RepeatMode::All:
-        return "All";
+    case RepeatMode::List:
+        return "List";
     case RepeatMode::Off:
     default:
         return "Off";
@@ -1515,11 +1524,8 @@ RepeatMode repeat_from_string(const std::string &value)
     if (lower == "one") {
         return RepeatMode::One;
     }
-    if (lower == "album") {
-        return RepeatMode::Album;
-    }
-    if (lower == "all") {
-        return RepeatMode::All;
+    if (lower == "list" || lower == "all" || lower == "album") {
+        return RepeatMode::List;
     }
     return RepeatMode::Off;
 }
@@ -1817,6 +1823,9 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
     screen.status = std::string("SD ") + (index.tracks.empty() ? "EMPTY" : "OK") + " | Vol " +
                     std::to_string(playback.volume) + " | LF " + to_string(playback.lofi.preset);
     screen.volume_percent = playback.volume;
+    screen.repeat_mode = playback.repeat;
+    screen.shuffle_enabled = playback.queue.shuffle;
+    screen.lofi_active = lofi_profile_active(playback.lofi);
     if (ui.page == Page::LofiPresets || ui.page == Page::LofiEdit) {
         screen.meta = "Intensity " + std::to_string((std::max(0, std::min(100, playback.lofi.intensity)) + 5) / 10) +
                       "/10";
@@ -1838,7 +1847,7 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
             const Track &track = index.tracks[static_cast<size_t>(current)];
             screen.position_seconds = playback.position_seconds;
             screen.duration_seconds = track.duration_seconds;
-            if (!playback.playing || playback.position_seconds > 0) {
+            if (!track.album_art_cache_path.empty()) {
                 screen.album_art_cache_path = track.album_art_cache_path;
             }
             screen.rows.push_back({track.title, playback.playing ? ">" : "||"});
@@ -2339,9 +2348,8 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
     }
     if (action == Action::Repeat) {
         playback.repeat = playback.repeat == RepeatMode::Off   ? RepeatMode::One
-                          : playback.repeat == RepeatMode::One ? RepeatMode::Album
-                          : playback.repeat == RepeatMode::Album ? RepeatMode::All
-                                                                 : RepeatMode::Off;
+                          : playback.repeat == RepeatMode::One ? RepeatMode::List
+                                                               : RepeatMode::Off;
         ui.toast = std::string("Repeat ") + to_string(playback.repeat);
         return;
     }
@@ -2841,15 +2849,13 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
             ui.toast = "Brightness " + std::to_string(playback.brightness_percent) + "%";
         } else if (ui.selected == 2 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
             if (action == Action::Left) {
-                playback.repeat = playback.repeat == RepeatMode::Off     ? RepeatMode::All
-                                  : playback.repeat == RepeatMode::All   ? RepeatMode::Album
-                                  : playback.repeat == RepeatMode::Album ? RepeatMode::One
-                                                                         : RepeatMode::Off;
+                playback.repeat = playback.repeat == RepeatMode::Off   ? RepeatMode::List
+                                  : playback.repeat == RepeatMode::List ? RepeatMode::One
+                                                                       : RepeatMode::Off;
             } else {
                 playback.repeat = playback.repeat == RepeatMode::Off   ? RepeatMode::One
-                                  : playback.repeat == RepeatMode::One ? RepeatMode::Album
-                                  : playback.repeat == RepeatMode::Album ? RepeatMode::All
-                                                                         : RepeatMode::Off;
+                                  : playback.repeat == RepeatMode::One ? RepeatMode::List
+                                                                       : RepeatMode::Off;
             }
             ui.toast = std::string("Repeat ") + to_string(playback.repeat);
         } else if (ui.selected == 3 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
@@ -2956,6 +2962,9 @@ std::vector<std::string> screen_to_lines(const ScreenModel &screen)
     if (screen.volume_overlay_active) {
         lines.push_back("volume_overlay:" + std::to_string(screen.volume_overlay_percent));
     }
+    if (screen.mode_overlay_active) {
+        lines.push_back("mode_overlay:" + screen.mode_overlay_kind + ":" + screen.mode_overlay_value);
+    }
     for (const ScreenLine &row : screen.rows) {
         lines.push_back(row.right.empty() ? row.left : row.left + " | " + row.right);
     }
@@ -2990,6 +2999,7 @@ std::string screen_auto_snapshot(const ScreenModel &screen, uint32_t revision)
         << " bg=" << (screen.background_task_active ? 1 : 0)
         << " bg_frame=" << static_cast<unsigned>(screen.background_task_frame % 4)
         << " volume_overlay=" << (screen.volume_overlay_active ? screen.volume_overlay_percent : -1)
+        << " mode_overlay=\"" << (screen.mode_overlay_active ? screen.mode_overlay_kind + ":" + screen.mode_overlay_value : "") << "\""
         << " soft=\"" << screen.soft_left << "|" << screen.soft_center << "|" << screen.soft_right << "\"";
     return out.str();
 }

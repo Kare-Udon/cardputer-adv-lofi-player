@@ -1534,11 +1534,8 @@ int repeat_indicator_index(const std::string &value)
     if (value == "One") {
         return 1;
     }
-    if (value == "Album") {
+    if (value == "List") {
         return 2;
-    }
-    if (value == "All") {
-        return 3;
     }
     return 0;
 }
@@ -1677,7 +1674,7 @@ void draw_playback_setting_card(lv_obj_t *root,
         }
     } else if (item.label == "Repeat") {
         const int active = repeat_indicator_index(item.value);
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 3; ++i) {
             lv_rect(root, 81 + i * 16, 90, 9, 5, i == active ? accent : line);
         }
     } else if (item.label == "Shuffle") {
@@ -2028,8 +2025,43 @@ void draw_lvgl_volume_status_icon(lv_obj_t *root,
                           background);
 }
 
+const char *repeat_badge(lofi::RepeatMode repeat)
+{
+    switch (repeat) {
+    case lofi::RepeatMode::One:
+        return "1";
+    case lofi::RepeatMode::List:
+        return "";
+    case lofi::RepeatMode::Off:
+    default:
+        return "";
+    }
+}
+
+void draw_lvgl_repeat_status_icon(lv_obj_t *root,
+                                  int x,
+                                  int y,
+                                  lofi::RepeatMode repeat,
+                                  lv_color_t active,
+                                  lv_color_t inactive,
+                                  lv_color_t chrome)
+{
+    const bool enabled = repeat != lofi::RepeatMode::Off;
+    lv_obj_t *icon = lv_label(root, LV_SYMBOL_LOOP, x, y, 22, enabled ? active : inactive, lv_font_symbol_small());
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    const char *badge = repeat_badge(repeat);
+    if (badge[0] != '\0') {
+        lv_obj_t *label = lv_label(root, badge, x + 14, y + 3, 8, active, lv_font_tiny());
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_rect(root, x + 15, y + 9, 4, 1, chrome);
+    }
+}
+
 void draw_lvgl_now_playing_footer(lv_obj_t *root,
                                   int volume_percent,
+                                  lofi::RepeatMode repeat,
+                                  bool shuffle_enabled,
+                                  bool lofi_active,
                                   lv_color_t chrome,
                                   lv_color_t accent,
                                   lv_color_t teal,
@@ -2044,22 +2076,25 @@ void draw_lvgl_now_playing_footer(lv_obj_t *root,
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
     lv_label(root, "MENU", 36, 123, 42, ink, lv_font_now_chrome());
 
-    lv_rect(root, 104, 123, 1, 9, line);
-    draw_lvgl_volume_status_icon(root, 112, 122, volume_percent, teal, chrome);
+    lv_rect(root, 98, 123, 1, 9, line);
+    draw_lvgl_volume_status_icon(root, 106, 122, volume_percent, teal, chrome);
 
-    lv_rect(root, 138, 123, 1, 9, line);
-    lv_obj_t *repeat = lv_label(root, LV_SYMBOL_LOOP, 144, 121, 22, accent, lv_font_symbol_small());
-    lv_obj_set_style_text_align(repeat, LV_TEXT_ALIGN_CENTER, 0);
+    lv_rect(root, 131, 123, 1, 9, line);
+    draw_lvgl_repeat_status_icon(root, 138, 121, repeat, accent, dim, chrome);
 
-    lv_rect(root, 172, 123, 1, 9, line);
-    lv_obj_t *lofi = lv_label(root, "LOFI", 178, 123, 29, teal, lv_font_now_chrome());
+    lv_rect(root, 162, 123, 1, 9, line);
+    lv_obj_t *shuffle = lv_label(root,
+                                 LV_SYMBOL_SHUFFLE,
+                                 169,
+                                 121,
+                                 22,
+                                 shuffle_enabled ? accent : dim,
+                                 lv_font_symbol_small());
+    lv_obj_set_style_text_align(shuffle, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_rect(root, 193, 123, 1, 9, line);
+    lv_obj_t *lofi = lv_label(root, "LOFI", 199, 123, 34, lofi_active ? teal : dim, lv_font_now_chrome());
     lv_obj_set_style_text_align(lofi, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_rect(root, 209, 123, 1, 9, line);
-    lv_obj_t *queue = lv_label(root, LV_SYMBOL_LIST, 216, 121, 16, ink, lv_font_symbol_small());
-    lv_obj_set_style_text_align(queue, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *queue_plus = lv_label(root, LV_SYMBOL_PLUS, 230, 123, 8, ink, lv_font_symbol_small());
-    lv_obj_set_style_text_align(queue_plus, LV_TEXT_ALIGN_CENTER, 0);
 }
 
 void draw_lvgl_volume_overlay(lv_obj_t *root,
@@ -2094,6 +2129,33 @@ void draw_lvgl_volume_overlay(lv_obj_t *root,
         const int tx = 11 + i * 29;
         lv_rect(box, tx, 42, 1, 2, i * 25 <= volume_percent ? accent : line);
     }
+}
+
+void draw_lvgl_mode_overlay(lv_obj_t *root,
+                            const lofi::ScreenModel &screen,
+                            lv_color_t bg,
+                            lv_color_t panel,
+                            lv_color_t accent,
+                            lv_color_t teal,
+                            lv_color_t ink,
+                            lv_color_t dim,
+                            lv_color_t line)
+{
+    constexpr int w = 150;
+    constexpr int h = 48;
+    constexpr int x = (240 - w) / 2;
+    constexpr int y = (135 - h) / 2;
+    lv_obj_t *box = lv_rect(root, x, y, w, h, panel, 3, accent, 1);
+    lv_rect(box, 3, 3, w - 6, h - 6, bg, 2, line, 1);
+
+    const bool shuffle = screen.mode_overlay_kind == "shuffle";
+    const char *symbol = shuffle ? LV_SYMBOL_SHUFFLE : LV_SYMBOL_LOOP;
+    lv_obj_t *icon = lv_label(box, symbol, 13, 13, 30, shuffle ? teal : accent, lv_font_symbol_title());
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_label(box, screen.mode_overlay_title.empty() ? "MODE" : screen.mode_overlay_title, 49, 8, 78, dim, lv_font_small());
+    lv_obj_t *value = lv_label(box, screen.mode_overlay_value, 49, 23, 84, ink, lv_font_normal());
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
 }
 
 bool load_album_art_cache(const std::string &path)
@@ -2263,9 +2325,22 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
         lv_rect(root, 98, 111, progress_value - 3, 2, accent);
     }
 
-    draw_lvgl_now_playing_footer(root, screen.volume_percent, chrome, accent, teal, ink, dim, line);
+    draw_lvgl_now_playing_footer(root,
+                                 screen.volume_percent,
+                                 screen.repeat_mode,
+                                 screen.shuffle_enabled,
+                                 screen.lofi_active,
+                                 chrome,
+                                 accent,
+                                 teal,
+                                 ink,
+                                 dim,
+                                 line);
     if (screen.volume_overlay_active) {
         draw_lvgl_volume_overlay(root, screen.volume_overlay_percent, bg, panel, accent, teal, ink, dim, line);
+    }
+    if (screen.mode_overlay_active) {
+        draw_lvgl_mode_overlay(root, screen, bg, panel, accent, teal, ink, dim, line);
     }
     lv_refr_now(s_lvgl_display);
     return ESP_OK;

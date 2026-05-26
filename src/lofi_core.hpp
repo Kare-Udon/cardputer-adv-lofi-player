@@ -9,8 +9,7 @@ namespace lofi {
 enum class RepeatMode {
     Off,
     One,
-    Album,
-    All,
+    List,
 };
 
 enum class LofiPreset {
@@ -210,10 +209,17 @@ struct ScreenModel {
     int position_seconds = 0;
     int duration_seconds = 0;
     int volume_percent = 0;
+    RepeatMode repeat_mode = RepeatMode::Off;
+    bool shuffle_enabled = false;
+    bool lofi_active = false;
     bool background_task_active = false;
     uint8_t background_task_frame = 0;
     bool volume_overlay_active = false;
     int volume_overlay_percent = 0;
+    bool mode_overlay_active = false;
+    std::string mode_overlay_kind;
+    std::string mode_overlay_title;
+    std::string mode_overlay_value;
 };
 
 bool is_audio_path(const std::string &path);
