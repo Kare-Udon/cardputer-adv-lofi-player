@@ -145,6 +145,7 @@ struct PlaybackState {
     int volume = 50;
     int brightness_percent = 100;
     int screen_off_seconds = 60;
+    int sleep_timer_seconds = 0;
     RepeatMode repeat = RepeatMode::Off;
     bool playing = false;
     Queue queue;
@@ -243,6 +244,7 @@ const char *to_string(Page page);
 LofiPreset preset_from_string(const std::string &value);
 RepeatMode repeat_from_string(const std::string &value);
 int audio_volume_from_user_percent(int volume);
+int setting_duration_seconds_from_value(const std::string &value);
 
 std::string serialize_playback_state(const PlaybackState &state);
 bool parse_playback_state(const std::string &text, PlaybackState &out);

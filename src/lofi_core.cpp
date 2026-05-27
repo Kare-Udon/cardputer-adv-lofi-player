@@ -484,6 +484,9 @@ constexpr LofiPreset kLofiPresetChoices[] = {
 constexpr size_t kLofiPresetChoiceCount = sizeof(kLofiPresetChoices) / sizeof(kLofiPresetChoices[0]);
 constexpr int kScreenOffChoices[] = {10, 15, 20, 30, 60, 120, 180, 300, 600, 0};
 constexpr size_t kScreenOffChoiceCount = sizeof(kScreenOffChoices) / sizeof(kScreenOffChoices[0]);
+constexpr int kSleepTimerChoices[] = {0, 300, 600, 900, 1800, 3600, 7200, 10800, 18000, 36000};
+constexpr size_t kSleepTimerChoiceCount = sizeof(kSleepTimerChoices) / sizeof(kSleepTimerChoices[0]);
+constexpr size_t kPlaybackMenuItemCount = 7;
 constexpr size_t kLibraryRootVisibleRows = 5;
 constexpr size_t kLibraryListVisibleRows = 4;
 constexpr int kVolumeBoostThreshold = 80;
@@ -583,6 +586,51 @@ std::string format_screen_off_seconds(int seconds)
         return std::to_string(seconds) + "s";
     }
     return std::to_string(seconds / 60) + "m";
+}
+
+int nearest_sleep_timer_choice_index(int seconds)
+{
+    if (seconds <= 0) {
+        return 0;
+    }
+    int best_index = 1;
+    int best_delta = std::abs(seconds - kSleepTimerChoices[1]);
+    for (size_t i = 2; i < kSleepTimerChoiceCount; ++i) {
+        const int delta = std::abs(seconds - kSleepTimerChoices[i]);
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_index = static_cast<int>(i);
+        }
+    }
+    return best_index;
+}
+
+int normalize_sleep_timer_seconds(int seconds)
+{
+    return kSleepTimerChoices[nearest_sleep_timer_choice_index(seconds)];
+}
+
+int step_sleep_timer_seconds(int seconds, int delta)
+{
+    int index = nearest_sleep_timer_choice_index(seconds);
+    if (delta < 0) {
+        index = index == 0 ? static_cast<int>(kSleepTimerChoiceCount) - 1 : index - 1;
+    } else if (delta > 0) {
+        index = index + 1 >= static_cast<int>(kSleepTimerChoiceCount) ? 0 : index + 1;
+    }
+    return kSleepTimerChoices[index];
+}
+
+std::string format_sleep_timer_seconds(int seconds)
+{
+    seconds = normalize_sleep_timer_seconds(seconds);
+    if (seconds <= 0) {
+        return "Off";
+    }
+    if (seconds < 3600) {
+        return std::to_string(seconds / 60) + "m";
+    }
+    return std::to_string(seconds / 3600) + "h";
 }
 
 void clamp_selection(UiState &ui, size_t count)
@@ -1539,6 +1587,20 @@ int audio_volume_from_user_percent(int volume)
     return 70 + ((volume - kVolumeBoostThreshold) * 10 + 10) / 20;
 }
 
+int setting_duration_seconds_from_value(const std::string &value)
+{
+    if (value == "Forever" || value == "Off") {
+        return 0;
+    }
+    int seconds = std::atoi(value.c_str());
+    if (value.find('h') != std::string::npos) {
+        seconds *= 3600;
+    } else if (value.find('m') != std::string::npos) {
+        seconds *= 60;
+    }
+    return seconds;
+}
+
 std::string serialize_playback_state(const PlaybackState &state)
 {
     std::ostringstream out;
@@ -1547,6 +1609,7 @@ std::string serialize_playback_state(const PlaybackState &state)
     out << "volume=" << normalize_user_volume_percent(state.volume) << "\n";
     out << "brightness_percent=" << normalize_brightness_percent(state.brightness_percent) << "\n";
     out << "screen_off_seconds=" << normalize_screen_off_seconds(state.screen_off_seconds) << "\n";
+    out << "sleep_timer_seconds=" << normalize_sleep_timer_seconds(state.sleep_timer_seconds) << "\n";
     out << "repeat=" << to_string(state.repeat) << "\n";
     out << "playing=" << (state.playing ? 1 : 0) << "\n";
     out << "queue_source_type=" << state.queue.source_type << "\n";
@@ -1585,6 +1648,8 @@ bool parse_playback_state(const std::string &text, PlaybackState &out)
             out.brightness_percent = normalize_brightness_percent(parse_int_or(value, out.brightness_percent));
         } else if (key == "screen_off_seconds") {
             out.screen_off_seconds = normalize_screen_off_seconds(parse_int_or(value, out.screen_off_seconds));
+        } else if (key == "sleep_timer_seconds") {
+            out.sleep_timer_seconds = normalize_sleep_timer_seconds(parse_int_or(value, out.sleep_timer_seconds));
         } else if (key == "repeat") {
             out.repeat = repeat_from_string(value);
         } else if (key == "playing") {
@@ -1620,6 +1685,7 @@ bool parse_playback_state(const std::string &text, PlaybackState &out)
     }
     out.brightness_percent = normalize_brightness_percent(out.brightness_percent);
     out.screen_off_seconds = normalize_screen_off_seconds(out.screen_off_seconds);
+    out.sleep_timer_seconds = normalize_sleep_timer_seconds(out.sleep_timer_seconds);
     return true;
 }
 
@@ -1674,6 +1740,7 @@ PlaybackRestoreResult restore_saved_playback_state(const LibraryIndex &index,
     restored.volume = normalize_user_volume_percent(saved.volume);
     restored.brightness_percent = normalize_brightness_percent(saved.brightness_percent);
     restored.screen_off_seconds = normalize_screen_off_seconds(saved.screen_off_seconds);
+    restored.sleep_timer_seconds = normalize_sleep_timer_seconds(saved.sleep_timer_seconds);
     restored.repeat = saved.repeat;
     restored.lofi = saved.lofi;
     restored.queue.shuffle = saved.queue.shuffle;
@@ -1685,6 +1752,7 @@ PlaybackRestoreResult restore_saved_playback_state(const LibraryIndex &index,
         queue_candidate.volume = restored.volume;
         queue_candidate.brightness_percent = restored.brightness_percent;
         queue_candidate.screen_off_seconds = restored.screen_off_seconds;
+        queue_candidate.sleep_timer_seconds = restored.sleep_timer_seconds;
         queue_candidate.repeat = restored.repeat;
         queue_candidate.lofi = restored.lofi;
         restored = queue_candidate;
@@ -2208,7 +2276,9 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
         screen.rows.push_back({std::string(ui.selected == 2 ? "> " : "  ") + "Repeat", to_string(playback.repeat)});
         screen.rows.push_back({std::string(ui.selected == 3 ? "> " : "  ") + "Shuffle", playback.queue.shuffle ? "On" : "Off"});
         screen.rows.push_back({std::string(ui.selected == 4 ? "> " : "  ") + "Queue", queue_pos});
-        screen.rows.push_back({std::string(ui.selected == 5 ? "> " : "  ") + "Screen Off",
+        screen.rows.push_back({std::string(ui.selected == 5 ? "> " : "  ") + "Sleep Timer",
+                               format_sleep_timer_seconds(playback.sleep_timer_seconds)});
+        screen.rows.push_back({std::string(ui.selected == 6 ? "> " : "  ") + "Screen Off",
                                format_screen_off_seconds(playback.screen_off_seconds)});
     } else if (ui.page == Page::Queue) {
         screen.soft_left = "Back";
@@ -2834,10 +2904,10 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
         break;
     case Page::PlaybackMenu:
         if (action == Action::Up) {
-            ui.selected = ui.selected == 0 ? 5 : ui.selected - 1;
+            ui.selected = ui.selected == 0 ? kPlaybackMenuItemCount - 1 : ui.selected - 1;
             ui.scroll = 0;
         } else if (action == Action::Down) {
-            ui.selected = (ui.selected + 1) % 6;
+            ui.selected = (ui.selected + 1) % kPlaybackMenuItemCount;
             ui.scroll = 0;
         } else if (ui.selected == 0 && action == Action::Left) {
             adjust_user_volume(playback, ui, -5);
@@ -2893,6 +2963,10 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
             ui.selected = playback.queue.current_index;
             clamp_selection(ui, playback.queue.track_indices.size());
         } else if (ui.selected == 5 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
+            playback.sleep_timer_seconds =
+                step_sleep_timer_seconds(playback.sleep_timer_seconds, action == Action::Left ? -1 : 1);
+            ui.toast = "Sleep Timer " + format_sleep_timer_seconds(playback.sleep_timer_seconds);
+        } else if (ui.selected == 6 && (action == Action::Left || action == Action::Right || action == Action::Ok)) {
             playback.screen_off_seconds =
                 step_screen_off_seconds(playback.screen_off_seconds, action == Action::Left ? -1 : 1);
             ui.toast = "Screen Off " + format_screen_off_seconds(playback.screen_off_seconds);

@@ -1851,13 +1851,14 @@ bool load_playback_state_if_possible(bool sd_mounted, const lofi::LibraryIndex &
     const lofi::PlaybackRestoreResult result = lofi::restore_saved_playback_state(library, restored, playback, false);
     ui.toast = result.queue_restored ? "Restored" : "Settings restored";
     ESP_LOGI(TAG,
-             "STATE_LOAD ok path=%s settings=%d queue=%d volume=%d brightness=%d sleep=%d",
+             "STATE_LOAD ok path=%s settings=%d queue=%d volume=%d brightness=%d screen_off=%d sleep_timer=%d",
              kStateFile,
              result.settings_restored ? 1 : 0,
              result.queue_restored ? 1 : 0,
              playback.volume,
              playback.brightness_percent,
-             playback.screen_off_seconds);
+             playback.screen_off_seconds,
+             playback.sleep_timer_seconds);
     return true;
 }
 
@@ -2192,6 +2193,8 @@ extern "C" void app_main(void)
     TickType_t last_keyboard_retry = xTaskGetTickCount();
     TickType_t last_user_activity = xTaskGetTickCount();
     TickType_t last_audio_cache_attempt = xTaskGetTickCount();
+    TickType_t sleep_timer_started_at = xTaskGetTickCount();
+    TickType_t last_sleep_timer_check = xTaskGetTickCount();
     TickType_t volume_overlay_until = 0;
     TickType_t mode_overlay_until = 0;
     std::string mode_overlay_kind;
@@ -2201,6 +2204,8 @@ extern "C" void app_main(void)
     bool last_background_task_active = false;
     uint8_t last_background_task_frame = 0;
     int last_saved_position = playback.position_seconds;
+    int last_sleep_timer_setting = playback.sleep_timer_seconds;
+    bool sleep_timer_armed = playback.playing && playback.sleep_timer_seconds > 0;
     bool state_saved = false;
     log_runtime_status(library, playback, ui, sd_mounted, state_saved);
     if (save_playback_state_if_possible(sd_mounted, playback)) {
@@ -2400,6 +2405,33 @@ extern "C" void app_main(void)
         if (ensure_current_album_art_cache(library, playback)) {
             needs_redraw = true;
             needs_screen_log = true;
+        }
+        const bool sleep_timer_setting_changed = playback.sleep_timer_seconds != last_sleep_timer_setting;
+        if (sleep_timer_setting_changed) {
+            last_sleep_timer_setting = playback.sleep_timer_seconds;
+            sleep_timer_started_at = xTaskGetTickCount();
+            sleep_timer_armed = playback.playing && playback.sleep_timer_seconds > 0;
+            ESP_LOGI(TAG, "SLEEP_TIMER setting=%d armed=%d", playback.sleep_timer_seconds, sleep_timer_armed ? 1 : 0);
+        }
+        if (!playback.playing || playback.sleep_timer_seconds <= 0) {
+            sleep_timer_armed = false;
+        } else if (!sleep_timer_armed) {
+            sleep_timer_started_at = xTaskGetTickCount();
+            last_sleep_timer_check = sleep_timer_started_at;
+            sleep_timer_armed = true;
+            ESP_LOGI(TAG, "SLEEP_TIMER armed timeout=%d", playback.sleep_timer_seconds);
+        } else if (xTaskGetTickCount() - last_sleep_timer_check >= pdMS_TO_TICKS(1000)) {
+            last_sleep_timer_check = xTaskGetTickCount();
+            if (last_sleep_timer_check - sleep_timer_started_at >=
+                pdMS_TO_TICKS(static_cast<uint32_t>(playback.sleep_timer_seconds) * 1000U)) {
+                playback.playing = false;
+                sleep_timer_armed = false;
+                ui.toast = "Sleep timer done";
+                ESP_LOGI(TAG, "SLEEP_TIMER pause timeout=%d", playback.sleep_timer_seconds);
+                needs_redraw = true;
+                needs_screen_log = true;
+                needs_state_save = true;
+            }
         }
         const bool animating_screen = background_task_active || ui.page == lofi::Page::NowPlaying ||
                                       ui.page == lofi::Page::Queue || ui.page == lofi::Page::Songs ||

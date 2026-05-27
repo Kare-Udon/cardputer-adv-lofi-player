@@ -1166,6 +1166,9 @@ const char *setting_symbol_for_label(const std::string &label)
     if (label == "Shuffle") {
         return LV_SYMBOL_SHUFFLE;
     }
+    if (label == "Sleep Timer") {
+        return LV_SYMBOL_AUDIO;
+    }
     if (label == "Screen Off") {
         return LV_SYMBOL_EYE_CLOSE;
     }
@@ -1200,6 +1203,9 @@ std::string setting_display_label(const std::string &label)
     }
     if (label == "Screen Off") {
         return "SLEEP";
+    }
+    if (label == "Sleep Timer") {
+        return "TIMER";
     }
     std::string out = label;
     std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
@@ -1542,14 +1548,26 @@ int repeat_indicator_index(const std::string &value)
 
 int screen_off_seconds_from_setting_value(const std::string &value)
 {
-    if (value == "Forever") {
+    return lofi::setting_duration_seconds_from_value(value);
+}
+
+int sleep_timer_choice_index_from_value(const std::string &value)
+{
+    constexpr int choices[] = {0, 300, 600, 900, 1800, 3600, 7200, 10800, 18000, 36000};
+    const int seconds = screen_off_seconds_from_setting_value(value);
+    if (seconds <= 0) {
         return 0;
     }
-    int seconds = std::atoi(value.c_str());
-    if (value.find('m') != std::string::npos) {
-        seconds *= 60;
+    int best_index = 1;
+    int best_distance = std::abs(seconds - choices[1]);
+    for (int i = 2; i < static_cast<int>(sizeof(choices) / sizeof(choices[0])); ++i) {
+        const int distance = std::abs(seconds - choices[i]);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = i;
+        }
     }
-    return seconds;
+    return best_index;
 }
 
 int screen_off_choice_index_from_value(const std::string &value)
@@ -1583,6 +1601,32 @@ void draw_screen_off_discrete_timeline(lv_obj_t *root,
     constexpr int kW = 96;
     constexpr int kChoices = 10;
     const int active = screen_off_choice_index_from_value(value);
+
+    lv_rect(root, kX, kY + 6, kW, 2, progress);
+    for (int i = 0; i < kChoices; ++i) {
+        const int cx = kX + (kW * i + (kChoices - 2) / 2) / (kChoices - 1);
+        if (i < active) {
+            lv_rect(root, cx - 2, kY + 4, 4, 4, accent, 2);
+        } else if (i == active) {
+            lv_rect(root, cx - 4, kY + 2, 8, 8, teal, 4, accent, 1);
+        } else {
+            lv_rect(root, cx - 2, kY + 4, 4, 4, line, 2);
+        }
+    }
+}
+
+void draw_sleep_timer_discrete_timeline(lv_obj_t *root,
+                                        const std::string &value,
+                                        lv_color_t accent,
+                                        lv_color_t teal,
+                                        lv_color_t line,
+                                        lv_color_t progress)
+{
+    constexpr int kX = 82;
+    constexpr int kY = 86;
+    constexpr int kW = 96;
+    constexpr int kChoices = 10;
+    const int active = sleep_timer_choice_index_from_value(value);
 
     lv_rect(root, kX, kY + 6, kW, 2, progress);
     for (int i = 0; i < kChoices; ++i) {
@@ -1652,8 +1696,9 @@ void draw_playback_setting_card(lv_obj_t *root,
     align_center(icon);
 
     lv_label(root, setting_display_label(item.label), 73, 52, 72, ink, lv_font_normal());
-    const lv_font_t *value_font = item.value.size() > 3 ? lv_font_home_label() : lv_font_title();
-    lv_obj_t *value = lv_label(root, item.value, 134, 50, 70, ink, value_font);
+    const bool compact_value = item.value.size() > 3 || item.value.find('h') != std::string::npos;
+    const lv_font_t *value_font = compact_value ? lv_font_home_label() : lv_font_title();
+    lv_obj_t *value = lv_label(root, item.value, 126, 50, 70, ink, value_font);
     lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
 
     if (item.adjustable) {
@@ -1680,6 +1725,8 @@ void draw_playback_setting_card(lv_obj_t *root,
     } else if (item.label == "Shuffle") {
         const bool on = item.value == "On";
         draw_lvgl_setting_switch(root, 82, 86, on, accent, ink, line, progress);
+    } else if (item.label == "Sleep Timer") {
+        draw_sleep_timer_discrete_timeline(root, item.value, accent, teal, line, progress);
     } else if (item.label == "Screen Off") {
         draw_screen_off_discrete_timeline(root, item.value, accent, teal, line, progress);
     } else {
