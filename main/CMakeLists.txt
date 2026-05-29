@@ -8,6 +8,7 @@ idf_component_register(
         "lofi_font_fusion_pixel_ui_12.c"
         "lofi_font_fusion_pixel_ui_16.c"
         "lofi_font_fusion_pixel_ui_20.c"
+        "generated_icons/boot_cassette_rgb565.c"
         "generated_icons/library_center_rgb565.c"
         "generated_icons/library_side_rgb565.c"
         "generated_icons/lofi_center_rgb565.c"

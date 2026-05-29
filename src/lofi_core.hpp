@@ -260,6 +260,7 @@ QueueSnapshotRestoreResult restore_queue_snapshot(const LibraryIndex &index,
                                                   bool resume_playing);
 
 ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playback, const UiState &ui);
+ScreenModel render_boot_splash_screen(void);
 void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &ui, Action action);
 
 std::vector<std::string> screen_to_lines(const ScreenModel &screen);

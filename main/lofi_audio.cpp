@@ -31,6 +31,17 @@ namespace lofi_audio {
 namespace {
 
 const char *TAG = "lofi_audio";
+
+#ifndef LOFI_AUDIO_TRACE_LOGS
+#define LOFI_AUDIO_TRACE_LOGS 0
+#endif
+
+#if LOFI_AUDIO_TRACE_LOGS
+#define LOFI_AUDIO_TRACE(fmt, ...) ESP_LOGI(TAG, fmt, __VA_ARGS__)
+#else
+#define LOFI_AUDIO_TRACE(fmt, ...) do { } while (0)
+#endif
+
 constexpr uint32_t kAudioTaskStackBytes = 16384;
 constexpr UBaseType_t kAudioTaskPriority = 8;
 constexpr size_t kSimpleDecoderInputBytes = 8 * 1024;
@@ -187,7 +198,7 @@ esp_err_t apply_es8311_volume(int volume)
     esp_err_t err = es8311_write(ES8311_DAC_REG32, static_cast<uint8_t>(reg));
     if (err == ESP_OK) {
         s_codec_volume_reg = reg;
-        ESP_LOGI(TAG, "AUDIO_VOLUME app=%d dac=0x%02x", s_requested_volume, reg);
+        LOFI_AUDIO_TRACE("AUDIO_VOLUME app=%d dac=0x%02x", s_requested_volume, reg);
     } else {
         ESP_LOGW(TAG, "AUDIO_VOLUME failed app=%d dac=0x%02x err=%s",
                  s_requested_volume,

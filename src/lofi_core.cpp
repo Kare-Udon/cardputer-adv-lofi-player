@@ -507,16 +507,42 @@ int normalize_user_volume_percent(int percent)
     return std::max(0, std::min(100, percent));
 }
 
+bool volume_adjust_delta_for_action(const UiState &ui, Action action, int &delta)
+{
+    if (ui.page == Page::NowPlaying) {
+        if (action == Action::Up) {
+            delta = 5;
+            return true;
+        }
+        if (action == Action::Down) {
+            delta = -5;
+            return true;
+        }
+    }
+    if (ui.page == Page::PlaybackMenu && ui.selected == 0) {
+        if (action == Action::Left) {
+            delta = -5;
+            return true;
+        }
+        if (action == Action::Right || action == Action::Ok) {
+            delta = 5;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool adjust_user_volume(PlaybackState &playback, UiState &ui, int delta)
 {
     const int current = normalize_user_volume_percent(playback.volume);
-    if (delta > 0 && current == kVolumeBoostThreshold && !ui.volume_boost_warning_armed) {
+    const int next = normalize_user_volume_percent(current + delta);
+    if (delta > 0 && current <= kVolumeBoostThreshold && next > kVolumeBoostThreshold &&
+        !ui.volume_boost_warning_armed) {
         ui.volume_boost_warning_armed = true;
         ui.toast = "Distortion risk. Press again";
         return false;
     }
 
-    const int next = normalize_user_volume_percent(current + delta);
     playback.volume = next;
     if (next <= kVolumeBoostThreshold || delta < 0) {
         ui.volume_boost_warning_armed = false;
@@ -2328,15 +2354,22 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
     return screen;
 }
 
+ScreenModel render_boot_splash_screen(void)
+{
+    ScreenModel screen;
+    screen.title = "Boot";
+    screen.subtitle = "Pocket Lo-Fi Player";
+    return screen;
+}
+
 void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &ui, Action action)
 {
     if (action == Action::None) {
         return;
     }
-    const bool volume_increase_action =
-        (ui.page == Page::NowPlaying && action == Action::Up) ||
-        (ui.page == Page::PlaybackMenu && ui.selected == 0 && (action == Action::Right || action == Action::Ok));
-    if (!volume_increase_action) {
+    int volume_delta = 0;
+    const bool volume_adjust_action = volume_adjust_delta_for_action(ui, action, volume_delta);
+    if (!volume_adjust_action || volume_delta <= 0) {
         ui.volume_boost_warning_armed = false;
     }
 

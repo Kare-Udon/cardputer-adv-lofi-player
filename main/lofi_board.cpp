@@ -34,6 +34,7 @@ extern "C" const lv_font_t lofi_font_fusion_pixel_8;
 extern "C" const lv_font_t lofi_font_fusion_pixel_ui_12;
 extern "C" const lv_font_t lofi_font_fusion_pixel_ui_16;
 extern "C" const lv_font_t lofi_font_fusion_pixel_ui_20;
+extern "C" const lv_image_dsc_t boot_cassette_rgb565;
 extern "C" const lv_image_dsc_t library_center_rgb565;
 extern "C" const lv_image_dsc_t library_side_rgb565;
 extern "C" const lv_image_dsc_t lofi_center_rgb565;
@@ -49,6 +50,16 @@ namespace lofi_board {
 namespace {
 
 const char *TAG = "lofi_board";
+
+#ifndef LOFI_INPUT_TRACE_LOGS
+#define LOFI_INPUT_TRACE_LOGS 0
+#endif
+
+#if LOFI_INPUT_TRACE_LOGS
+#define LOFI_KBD_TRACE(fmt, ...) ESP_LOGI(TAG, fmt, __VA_ARGS__)
+#else
+#define LOFI_KBD_TRACE(fmt, ...) do { } while (0)
+#endif
 
 esp_lcd_panel_handle_t s_lcd_panel = nullptr;
 esp_lcd_panel_io_handle_t s_lcd_panel_io = nullptr;
@@ -617,6 +628,28 @@ bool keyboard_action_repeats(lofi::Action action)
            action == lofi::Action::Right;
 }
 
+bool keyboard_action_uses_fast_repeat(lofi::Action action)
+{
+    return action == lofi::Action::Up || action == lofi::Action::Down;
+}
+
+TickType_t keyboard_initial_repeat_delay(lofi::Action action)
+{
+    return pdMS_TO_TICKS(keyboard_action_uses_fast_repeat(action) ? 220 : 430);
+}
+
+TickType_t keyboard_repeat_interval(lofi::Action action, uint32_t repeat_count)
+{
+    if (keyboard_action_uses_fast_repeat(action)) {
+        return repeat_count < 4   ? pdMS_TO_TICKS(120)
+               : repeat_count < 12 ? pdMS_TO_TICKS(80)
+                                   : pdMS_TO_TICKS(55);
+    }
+    return repeat_count < 4   ? pdMS_TO_TICKS(170)
+           : repeat_count < 12 ? pdMS_TO_TICKS(95)
+                               : pdMS_TO_TICKS(55);
+}
+
 void keyboard_hold_begin(lofi::Action action, const char *key_name)
 {
     if (!keyboard_action_repeats(action)) {
@@ -631,11 +664,23 @@ void keyboard_hold_begin(lofi::Action action, const char *key_name)
     s_hold_started_tick = xTaskGetTickCount();
     s_hold_last_emit_tick = s_hold_started_tick;
     s_hold_repeat_count = 0;
+    LOFI_KBD_TRACE("KBD_HOLD_BEGIN key=%s action=%d repeat=%d initial_ms=%u",
+                   s_hold_key_name,
+                   static_cast<int>(action),
+                   keyboard_action_repeats(action) ? 1 : 0,
+                   static_cast<unsigned>(keyboard_initial_repeat_delay(action) * portTICK_PERIOD_MS));
 }
 
 void keyboard_hold_end(const char *key_name)
 {
     if (s_hold_active && std::strcmp(s_hold_key_name, key_name) == 0) {
+#if LOFI_INPUT_TRACE_LOGS
+        const TickType_t now = xTaskGetTickCount();
+        LOFI_KBD_TRACE("KBD_HOLD_END key=%s held_ms=%u repeats=%u",
+                       key_name,
+                       static_cast<unsigned>((now - s_hold_started_tick) * portTICK_PERIOD_MS),
+                       static_cast<unsigned>(s_hold_repeat_count));
+#endif
         s_hold_active = false;
         s_hold_action = lofi::Action::None;
         s_hold_key_name[0] = '-';
@@ -650,14 +695,13 @@ bool keyboard_hold_repeat(lofi::Action &action, const char **key_name)
     }
     const TickType_t now = xTaskGetTickCount();
     const TickType_t held = now - s_hold_started_tick;
-    if (held < pdMS_TO_TICKS(430)) {
+    if (held < keyboard_initial_repeat_delay(s_hold_action)) {
         return false;
     }
 
-    const TickType_t interval = s_hold_repeat_count < 4   ? pdMS_TO_TICKS(170)
-                                : s_hold_repeat_count < 12 ? pdMS_TO_TICKS(95)
-                                                           : pdMS_TO_TICKS(55);
-    if (now - s_hold_last_emit_tick < interval) {
+    const TickType_t interval = keyboard_repeat_interval(s_hold_action, s_hold_repeat_count);
+    const TickType_t since_last = now - s_hold_last_emit_tick;
+    if (since_last < interval) {
         return false;
     }
 
@@ -669,10 +713,13 @@ bool keyboard_hold_repeat(lofi::Action &action, const char **key_name)
     if (key_name) {
         *key_name = s_last_key_name;
     }
-    ESP_LOGI(TAG, "KBD_REPEAT key=%s action=%d count=%u",
-             s_last_key_name,
-             static_cast<int>(action),
-             static_cast<unsigned>(s_hold_repeat_count));
+    LOFI_KBD_TRACE("KBD_REPEAT key=%s action=%d count=%u held_ms=%u since_last_ms=%u target_ms=%u",
+                   s_last_key_name,
+                   static_cast<int>(action),
+                   static_cast<unsigned>(s_hold_repeat_count),
+                   static_cast<unsigned>(held * portTICK_PERIOD_MS),
+                   static_cast<unsigned>(since_last * portTICK_PERIOD_MS),
+                   static_cast<unsigned>(interval * portTICK_PERIOD_MS));
     return true;
 }
 
@@ -706,13 +753,15 @@ bool keyboard_poll(lofi::Action &action, const char **key_name)
         *key_name = s_last_key_name;
     }
     const lofi::Action mapped_action = keyboard_action_from_key(row, col);
-    ESP_LOGI(TAG, "KBD raw=0x%02x key=%s pressed=%d row=%u col=%u action=%d",
-             raw,
-             s_last_key_name,
-             pressed ? 1 : 0,
-             static_cast<unsigned>(row),
-             static_cast<unsigned>(col),
-             static_cast<int>(mapped_action));
+    LOFI_KBD_TRACE("KBD raw=0x%02x fifo=%u key=%s pressed=%d row=%u col=%u action=%d tick=%u",
+                   raw,
+                   static_cast<unsigned>(count & 0x0F),
+                   s_last_key_name,
+                   pressed ? 1 : 0,
+                   static_cast<unsigned>(row),
+                   static_cast<unsigned>(col),
+                   static_cast<int>(mapped_action),
+                   static_cast<unsigned>(xTaskGetTickCount()));
     if (!pressed) {
         keyboard_hold_end(s_last_key_name);
         return false;
@@ -1905,6 +1954,156 @@ void draw_home_page(lv_obj_t *parent,
     draw_home_caption(parent, items, count, selected, 0, accent, ink, line);
 }
 
+void draw_boot_frame(lv_obj_t *root, lv_color_t line, lv_color_t accent)
+{
+    lv_rect(root, 7, 6, 226, 1, line);
+    lv_rect(root, 7, 128, 226, 1, line);
+    lv_rect(root, 6, 7, 1, 121, line);
+    lv_rect(root, 233, 7, 1, 121, line);
+
+    lv_rect(root, 10, 9, 8, 2, accent);
+    lv_rect(root, 10, 9, 2, 8, accent);
+    lv_rect(root, 222, 9, 8, 2, accent);
+    lv_rect(root, 228, 9, 2, 8, accent);
+    lv_rect(root, 10, 124, 8, 2, accent);
+    lv_rect(root, 10, 118, 2, 8, accent);
+    lv_rect(root, 222, 124, 8, 2, accent);
+    lv_rect(root, 228, 118, 2, 8, accent);
+}
+
+const char *const *boot_glyph_5x7(char ch)
+{
+    static const char *const blank[7] = {
+        "00000",
+        "00000",
+        "00000",
+        "00000",
+        "00000",
+        "00000",
+        "00000",
+    };
+    static const char *const f[7] = {
+        "11111",
+        "10000",
+        "10000",
+        "11110",
+        "10000",
+        "10000",
+        "10000",
+    };
+    static const char *const i[7] = {
+        "11111",
+        "00100",
+        "00100",
+        "00100",
+        "00100",
+        "00100",
+        "11111",
+    };
+    static const char *const l[7] = {
+        "10000",
+        "10000",
+        "10000",
+        "10000",
+        "10000",
+        "10000",
+        "11111",
+    };
+    static const char *const o[7] = {
+        "01110",
+        "10001",
+        "10001",
+        "10001",
+        "10001",
+        "10001",
+        "01110",
+    };
+
+    switch (std::toupper(static_cast<unsigned char>(ch))) {
+    case 'F':
+        return f;
+    case 'I':
+        return i;
+    case 'L':
+        return l;
+    case 'O':
+        return o;
+    default:
+        return blank;
+    }
+}
+
+int boot_text_width_5x7(const std::string &text, int scale, int spacing)
+{
+    int width = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        width += (text[i] == ' ' ? 3 : 5) * scale;
+        if (i + 1 < text.size()) {
+            width += spacing;
+        }
+    }
+    return width;
+}
+
+void draw_boot_text_5x7(lv_obj_t *root, const std::string &text, int x, int y, int scale, int spacing, lv_color_t color)
+{
+    int cursor = x;
+    for (char ch : text) {
+        const char *const *glyph = boot_glyph_5x7(ch);
+        const int glyph_w = ch == ' ' ? 3 : 5;
+        for (int row = 0; row < 7; ++row) {
+            for (int col = 0; col < glyph_w; ++col) {
+                if (glyph[row][col] == '1') {
+                    lv_rect(root, cursor + col * scale, y + row * scale, scale, scale, color);
+                }
+            }
+        }
+        cursor += glyph_w * scale + spacing;
+    }
+}
+
+esp_err_t draw_screen_lvgl_boot(const lofi::ScreenModel &screen)
+{
+    if (!s_lvgl_display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const lv_color_t bg = lv_rgb(11, 13, 18);
+    const lv_color_t accent = lv_rgb(244, 162, 79);
+    const lv_color_t teal = lv_rgb(116, 199, 195);
+    const lv_color_t ink = lv_rgb(245, 223, 182);
+    const lv_color_t line = lv_rgb(78, 68, 82);
+
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_clean(root);
+    lv_obj_set_style_bg_color(root, bg, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    draw_boot_frame(root, line, accent);
+    lv_obj_t *cassette = lv_image_create(root);
+    lv_image_set_src(cassette, &boot_cassette_rgb565);
+    lv_obj_set_pos(cassette, 78, 18);
+
+    const std::string title_text = "LOFI";
+    const int title_width = boot_text_width_5x7(title_text, 3, 3);
+    draw_boot_text_5x7(root, title_text, (LCD_WIDTH - title_width) / 2 + 1, 79, 3, 3, lv_rgb(45, 37, 42));
+    draw_boot_text_5x7(root, title_text, (LCD_WIDTH - title_width) / 2, 78, 3, 3, ink);
+
+    lv_obj_t *subtitle = lv_label(root,
+                                  screen.subtitle.empty() ? "Pocket Lo-Fi Player" : screen.subtitle,
+                                  0,
+                                  108,
+                                  LCD_WIDTH,
+                                  teal,
+                                  lv_font_small());
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_refr_now(s_lvgl_display);
+    wait_for_lvgl_flush_idle(80);
+    return ESP_OK;
+}
+
 esp_err_t draw_screen_lvgl_home(const lofi::ScreenModel &screen)
 {
     if (!s_lvgl_display) {
@@ -2178,6 +2377,15 @@ void draw_lvgl_volume_overlay(lv_obj_t *root,
     }
 }
 
+void draw_lvgl_volume_warning_banner(lv_obj_t *root,
+                                     lv_color_t preview,
+                                     lv_color_t accent,
+                                     const lv_font_t *font)
+{
+    lv_rect(root, 22, 23, 196, 15, preview, 2, accent, 1);
+    lv_clipped_label(root, "LIMIT >80 - PRESS AGAIN", 29, 24, 184, 13, -2, accent, font);
+}
+
 void draw_lvgl_mode_overlay(lv_obj_t *root,
                             const lofi::ScreenModel &screen,
                             lv_color_t bg,
@@ -2337,6 +2545,7 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
     const lv_color_t ink = lv_rgb(248, 233, 207);
     const lv_color_t dim = lv_rgb(162, 152, 138);
     const lv_color_t line = lv_rgb(69, 60, 71);
+    const lv_color_t preview = lv_rgb(28, 25, 35);
     const lv_color_t progress = lv_rgb(51, 45, 55);
 
     lv_obj_t *root = lv_screen_active();
@@ -2383,6 +2592,11 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
                                  ink,
                                  dim,
                                  line);
+    const bool volume_warning_active =
+        screen.volume_overlay_active && screen.status.find("Distortion risk") != std::string::npos;
+    if (volume_warning_active) {
+        draw_lvgl_volume_warning_banner(root, preview, accent, lv_font_small());
+    }
     if (screen.volume_overlay_active) {
         draw_lvgl_volume_overlay(root, screen.volume_overlay_percent, bg, panel, accent, teal, ink, dim, line);
     }
@@ -2430,8 +2644,7 @@ esp_err_t draw_screen_lvgl_playback_menu(const lofi::ScreenModel &screen)
     const int selected = std::max(0, std::min<int>(selected_row_index(screen), static_cast<int>(items.size()) - 1));
     const bool warning_status = screen.status.find("Distortion risk") != std::string::npos;
     if (warning_status) {
-        lv_rect(root, 22, 23, 196, 15, preview, 2, accent, 1);
-        lv_clipped_label(root, "DISTORTION RISK - PRESS AGAIN", 29, 24, 184, 13, -2, accent, lv_font_small());
+        draw_lvgl_volume_warning_banner(root, preview, accent, lv_font_small());
     } else if (selected > 0) {
         draw_playback_setting_preview(root, items[selected - 1], 21, preview, ink, dim, line);
     } else if (items.size() > 1) {
@@ -2830,12 +3043,11 @@ esp_err_t init_display(void)
     bl_channel.channel = kBacklightLedcChannel;
     bl_channel.intr_type = LEDC_INTR_DISABLE;
     bl_channel.timer_sel = kBacklightLedcTimer;
-    bl_channel.duty = kBacklightLedcMaxDuty;
+    bl_channel.duty = 0;
     bl_channel.hpoint = 0;
     ESP_RETURN_ON_ERROR(ledc_channel_config(&bl_channel), TAG, "lcd bl ledc");
     s_backlight_pwm_ready = true;
-    s_screen_awake = true;
-    apply_backlight();
+    s_screen_awake = false;
 
     ESP_RETURN_ON_ERROR(lcd_draw_solid(lcd_color565(8, 12, 18)), TAG, "lcd clear");
     ESP_RETURN_ON_ERROR(init_lvgl_display(), TAG, "lvgl init");
@@ -2870,6 +3082,10 @@ esp_err_t draw_screen(const lofi::ScreenModel &screen)
         return ESP_ERR_INVALID_STATE;
     }
     const uint16_t lvgl_bg = lcd_color565(20, 18, 24);
+    if (screen.title == "Boot" && s_lvgl_display) {
+        ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lcd_color565(11, 13, 18)), TAG, "boot preclear");
+        return draw_screen_lvgl_boot(screen);
+    }
     if (screen.title == "Help" && s_lvgl_display) {
         ESP_RETURN_ON_ERROR(preclear_panel_on_page_change(screen.title, lvgl_bg), TAG, "help preclear");
         return draw_screen_lvgl_help(screen);
