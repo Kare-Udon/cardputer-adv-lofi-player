@@ -1,6 +1,7 @@
 #include "lofi_board.hpp"
 
 #include "board_pins.h"
+#include "lofi_input.hpp"
 #include "lofi_volume_icons.hpp"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/ledc.h"
@@ -61,13 +63,25 @@ const char *TAG = "lofi_board";
 #define LOFI_KBD_TRACE(fmt, ...) do { } while (0)
 #endif
 
+struct KeyboardEvent {
+    lofi::Action action = lofi::Action::None;
+    char key_name[12] = "-";
+    bool repeated = false;
+    uint16_t repeat_count = 0;
+    TickType_t tick = 0;
+};
+
 esp_lcd_panel_handle_t s_lcd_panel = nullptr;
 esp_lcd_panel_io_handle_t s_lcd_panel_io = nullptr;
 i2c_master_bus_handle_t s_i2c_bus = nullptr;
 SemaphoreHandle_t s_i2c_mutex = nullptr;
+QueueHandle_t s_keyboard_event_queue = nullptr;
+TaskHandle_t s_keyboard_task = nullptr;
+bool s_keyboard_int_handler_added = false;
 bool s_keyboard_ready = false;
 bool s_fn_down = false;
 char s_last_key_name[12] = "-";
+char s_polled_key_name[12] = "-";
 KeyboardDiagnostics s_keyboard_diag;
 bool s_hold_active = false;
 lofi::Action s_hold_action = lofi::Action::None;
@@ -75,6 +89,13 @@ char s_hold_key_name[12] = "-";
 TickType_t s_hold_started_tick = 0;
 TickType_t s_hold_last_emit_tick = 0;
 uint16_t s_hold_repeat_count = 0;
+bool s_last_hardware_event_repeated = false;
+uint32_t s_keyboard_queued_events = 0;
+uint32_t s_keyboard_consumed_events = 0;
+uint32_t s_keyboard_dropped_repeats = 0;
+uint32_t s_keyboard_dropped_events = 0;
+uint32_t s_keyboard_last_event_age_ms = 0;
+uint32_t s_keyboard_max_event_age_ms = 0;
 uint16_t *s_shadow_framebuffer = nullptr;
 bool s_shadow_framebuffer_valid = false;
 uint32_t s_framebuffer_dump_seq = 0;
@@ -96,6 +117,11 @@ constexpr ledc_timer_t kBacklightLedcTimer = LEDC_TIMER_0;
 constexpr ledc_channel_t kBacklightLedcChannel = LEDC_CHANNEL_0;
 constexpr ledc_timer_bit_t kBacklightLedcResolution = LEDC_TIMER_10_BIT;
 constexpr uint32_t kBacklightLedcMaxDuty = (1U << 10) - 1U;
+constexpr UBaseType_t kKeyboardTaskPriority = 6;
+constexpr uint32_t kKeyboardTaskStackBytes = 4096;
+constexpr UBaseType_t kKeyboardEventQueueLength = 8;
+constexpr TickType_t kKeyboardPollHoldDelay = 1;
+constexpr TickType_t kKeyboardPollFallbackInterval = pdMS_TO_TICKS(25);
 
 struct MarqueeState {
     std::string text;
@@ -624,30 +650,17 @@ lofi::Action keyboard_action_from_key(uint8_t row, uint8_t col)
 
 bool keyboard_action_repeats(lofi::Action action)
 {
-    return action == lofi::Action::Up || action == lofi::Action::Down || action == lofi::Action::Left ||
-           action == lofi::Action::Right;
-}
-
-bool keyboard_action_uses_fast_repeat(lofi::Action action)
-{
-    return action == lofi::Action::Up || action == lofi::Action::Down;
+    return lofi_input::action_repeats(action);
 }
 
 TickType_t keyboard_initial_repeat_delay(lofi::Action action)
 {
-    return pdMS_TO_TICKS(keyboard_action_uses_fast_repeat(action) ? 220 : 430);
+    return pdMS_TO_TICKS(lofi_input::initial_repeat_delay_ms(action));
 }
 
 TickType_t keyboard_repeat_interval(lofi::Action action, uint32_t repeat_count)
 {
-    if (keyboard_action_uses_fast_repeat(action)) {
-        return repeat_count < 4   ? pdMS_TO_TICKS(120)
-               : repeat_count < 12 ? pdMS_TO_TICKS(80)
-                                   : pdMS_TO_TICKS(55);
-    }
-    return repeat_count < 4   ? pdMS_TO_TICKS(170)
-           : repeat_count < 12 ? pdMS_TO_TICKS(95)
-                               : pdMS_TO_TICKS(55);
+    return pdMS_TO_TICKS(lofi_input::repeat_interval_ms(action, repeat_count));
 }
 
 void keyboard_hold_begin(lofi::Action action, const char *key_name)
@@ -708,6 +721,7 @@ bool keyboard_hold_repeat(lofi::Action &action, const char **key_name)
     s_hold_last_emit_tick = now;
     ++s_hold_repeat_count;
     action = s_hold_action;
+    s_last_hardware_event_repeated = true;
     std::strncpy(s_last_key_name, s_hold_key_name, sizeof(s_last_key_name) - 1);
     s_last_key_name[sizeof(s_last_key_name) - 1] = '\0';
     if (key_name) {
@@ -723,7 +737,7 @@ bool keyboard_hold_repeat(lofi::Action &action, const char **key_name)
     return true;
 }
 
-bool keyboard_poll(lofi::Action &action, const char **key_name)
+bool keyboard_poll_hardware(lofi::Action &action, const char **key_name)
 {
     if (!s_keyboard_ready) {
         return false;
@@ -768,6 +782,7 @@ bool keyboard_poll(lofi::Action &action, const char **key_name)
     }
 
     action = mapped_action;
+    s_last_hardware_event_repeated = false;
     keyboard_hold_begin(action, s_last_key_name);
     if (action == lofi::Action::None) {
         if (std::strcmp(s_last_key_name, "C") == 0) {
@@ -776,6 +791,119 @@ bool keyboard_poll(lofi::Action &action, const char **key_name)
         return false;
     }
     return true;
+}
+
+void enqueue_keyboard_event(lofi::Action action, const char *key_name, bool repeated, uint16_t repeat_count)
+{
+    if (!s_keyboard_event_queue) {
+        return;
+    }
+
+    KeyboardEvent event;
+    event.action = action;
+    std::strncpy(event.key_name, key_name ? key_name : "?", sizeof(event.key_name) - 1);
+    event.key_name[sizeof(event.key_name) - 1] = '\0';
+    event.repeated = repeated;
+    event.repeat_count = repeat_count;
+    event.tick = xTaskGetTickCount();
+
+    const bool queue_full = uxQueueSpacesAvailable(s_keyboard_event_queue) == 0;
+    switch (lofi_input::queue_admission(queue_full, repeated)) {
+    case lofi_input::QueueAdmission::Enqueue:
+        if (xQueueSend(s_keyboard_event_queue, &event, 0) == pdTRUE) {
+            ++s_keyboard_queued_events;
+        } else if (repeated) {
+            ++s_keyboard_dropped_repeats;
+        } else {
+            ++s_keyboard_dropped_events;
+        }
+        break;
+    case lofi_input::QueueAdmission::DropIncomingRepeat:
+        ++s_keyboard_dropped_repeats;
+        break;
+    case lofi_input::QueueAdmission::DropOldestThenEnqueue: {
+        KeyboardEvent discarded;
+        if (xQueueReceive(s_keyboard_event_queue, &discarded, 0) == pdTRUE) {
+            ++s_keyboard_dropped_events;
+        }
+        if (xQueueSend(s_keyboard_event_queue, &event, 0) == pdTRUE) {
+            ++s_keyboard_queued_events;
+        } else {
+            ++s_keyboard_dropped_events;
+        }
+        break;
+    }
+    }
+}
+
+void keyboard_input_task(void *)
+{
+    while (true) {
+        if (!s_hold_active && gpio_get_level(static_cast<gpio_num_t>(PIN_KBD_INT)) != 0) {
+            ulTaskNotifyTake(pdTRUE, kKeyboardPollFallbackInterval);
+        }
+
+        lofi::Action action = lofi::Action::None;
+        const char *key_name = nullptr;
+        if (keyboard_poll_hardware(action, &key_name)) {
+            enqueue_keyboard_event(action, key_name, s_last_hardware_event_repeated, s_hold_repeat_count);
+            vTaskDelay(kKeyboardPollHoldDelay);
+        } else {
+            vTaskDelay(s_hold_active ? kKeyboardPollHoldDelay : 1);
+        }
+    }
+}
+
+void IRAM_ATTR keyboard_int_isr(void *)
+{
+    BaseType_t higher_priority_woken = pdFALSE;
+    if (s_keyboard_task) {
+        vTaskNotifyGiveFromISR(s_keyboard_task, &higher_priority_woken);
+    }
+    if (higher_priority_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+esp_err_t start_keyboard_input_task(void)
+{
+    if (!s_keyboard_event_queue) {
+        s_keyboard_event_queue = xQueueCreate(kKeyboardEventQueueLength, sizeof(KeyboardEvent));
+        if (!s_keyboard_event_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_keyboard_task) {
+        if (xTaskCreate(keyboard_input_task,
+                        "lofi_kbd",
+                        kKeyboardTaskStackBytes,
+                        nullptr,
+                        kKeyboardTaskPriority,
+                        &s_keyboard_task) != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t enable_keyboard_interrupt(void)
+{
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    if (!s_keyboard_int_handler_added) {
+        err = gpio_isr_handler_add(static_cast<gpio_num_t>(PIN_KBD_INT), keyboard_int_isr, nullptr);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        s_keyboard_int_handler_added = true;
+    }
+    ESP_RETURN_ON_ERROR(gpio_set_intr_type(static_cast<gpio_num_t>(PIN_KBD_INT), GPIO_INTR_NEGEDGE),
+                        TAG,
+                        "keyboard int type");
+    ESP_RETURN_ON_ERROR(gpio_intr_enable(static_cast<gpio_num_t>(PIN_KBD_INT)), TAG, "keyboard int enable");
+    return ESP_OK;
 }
 
 lv_color_t lv_rgb(uint8_t r, uint8_t g, uint8_t b)
@@ -3254,6 +3382,21 @@ esp_err_t init_keyboard(void)
 
     s_keyboard_ready = true;
     s_keyboard_diag.ready = true;
+    s_keyboard_diag.stage = "task";
+    err = start_keyboard_input_task();
+    if (err != ESP_OK) {
+        s_keyboard_ready = false;
+        s_keyboard_diag.ready = false;
+        s_keyboard_diag.init_err = err;
+        return err;
+    }
+    err = enable_keyboard_interrupt();
+    if (err != ESP_OK) {
+        s_keyboard_ready = false;
+        s_keyboard_diag.ready = false;
+        s_keyboard_diag.init_err = err;
+        return err;
+    }
     s_keyboard_diag.init_err = ESP_OK;
     s_keyboard_diag.stage = "ready";
     return ESP_OK;
@@ -3261,12 +3404,38 @@ esp_err_t init_keyboard(void)
 
 bool poll_action(lofi::Action &action, const char **key_name)
 {
-    return keyboard_poll(action, key_name);
+    if (!s_keyboard_event_queue) {
+        return false;
+    }
+    KeyboardEvent event;
+    if (xQueueReceive(s_keyboard_event_queue, &event, 0) != pdTRUE) {
+        return false;
+    }
+    action = event.action;
+    const uint32_t age_ms = static_cast<uint32_t>((xTaskGetTickCount() - event.tick) * portTICK_PERIOD_MS);
+    s_keyboard_last_event_age_ms = age_ms;
+    s_keyboard_max_event_age_ms = std::max(s_keyboard_max_event_age_ms, age_ms);
+    std::strncpy(s_polled_key_name, event.key_name, sizeof(s_polled_key_name) - 1);
+    s_polled_key_name[sizeof(s_polled_key_name) - 1] = '\0';
+    if (key_name) {
+        *key_name = s_polled_key_name;
+    }
+    ++s_keyboard_consumed_events;
+    return true;
 }
 
 KeyboardDiagnostics keyboard_diagnostics(void)
 {
     s_keyboard_diag.ready = s_keyboard_ready;
+    s_keyboard_diag.input_task_started = s_keyboard_task != nullptr;
+    s_keyboard_diag.queue_depth =
+        s_keyboard_event_queue ? static_cast<uint32_t>(uxQueueMessagesWaiting(s_keyboard_event_queue)) : 0;
+    s_keyboard_diag.queued_events = s_keyboard_queued_events;
+    s_keyboard_diag.consumed_events = s_keyboard_consumed_events;
+    s_keyboard_diag.dropped_repeats = s_keyboard_dropped_repeats;
+    s_keyboard_diag.dropped_events = s_keyboard_dropped_events;
+    s_keyboard_diag.last_event_age_ms = s_keyboard_last_event_age_ms;
+    s_keyboard_diag.max_event_age_ms = s_keyboard_max_event_age_ms;
     return s_keyboard_diag;
 }
 

@@ -2,6 +2,7 @@
 #include "lofi_aac_cache.hpp"
 #include "lofi_audio.hpp"
 #include "lofi_board.hpp"
+#include "lofi_input.hpp"
 #include "lofi_selftest_mp3.hpp"
 #include "lofi_storage.hpp"
 #include "lofi_wav.hpp"
@@ -103,12 +104,6 @@ void set_mode_overlay(lofi::ScreenModel &screen,
     screen.mode_overlay_kind = active ? kind : "";
     screen.mode_overlay_title = active ? title : "";
     screen.mode_overlay_value = active ? value : "";
-}
-
-bool action_is_repeat_hot_path(lofi::Action action)
-{
-    return action == lofi::Action::Up || action == lofi::Action::Down || action == lofi::Action::Left ||
-           action == lofi::Action::Right;
 }
 
 struct MediaFormatCounts {
@@ -1645,7 +1640,8 @@ void log_runtime_status(const lofi::LibraryIndex &library, const lofi::PlaybackS
     log_media_format_counts(library);
     ESP_LOGI(TAG,
              "LOFI_STATUS tick=%u page=%s nav=%u tracks=%u albums=%u artists=%u sd=%d playing=%d current=%d pos=%d "
-             "queue=%u state=%d kbd=%d kbd_stage=%s kbd_err=%s bus_err=%s probe_err=%s audio=%s audio_pos=%d msg=%s",
+             "queue=%u state=%d kbd=%d kbd_task=%d kbd_q=%u kbd_evt=%u/%u kbd_age=%u/%u kbd_drop=%u/%u kbd_stage=%s "
+             "kbd_err=%s bus_err=%s probe_err=%s audio=%s audio_pos=%d msg=%s",
              static_cast<unsigned>(xTaskGetTickCount()),
              lofi::to_string(ui.page),
              static_cast<unsigned>(ui.back_stack.size()),
@@ -1659,6 +1655,14 @@ void log_runtime_status(const lofi::LibraryIndex &library, const lofi::PlaybackS
              static_cast<unsigned>(playback.queue.track_indices.size()),
              state_saved ? 1 : 0,
              keyboard.ready ? 1 : 0,
+             keyboard.input_task_started ? 1 : 0,
+             static_cast<unsigned>(keyboard.queue_depth),
+             static_cast<unsigned>(keyboard.queued_events),
+             static_cast<unsigned>(keyboard.consumed_events),
+             static_cast<unsigned>(keyboard.last_event_age_ms),
+             static_cast<unsigned>(keyboard.max_event_age_ms),
+             static_cast<unsigned>(keyboard.dropped_repeats),
+             static_cast<unsigned>(keyboard.dropped_events),
              keyboard.stage,
              esp_err_to_name(keyboard.init_err),
              esp_err_to_name(keyboard.bus_err),
@@ -2426,7 +2430,7 @@ extern "C" void app_main(void)
                 lofi_board::set_screen_brightness_percent(playback.brightness_percent);
             }
             needs_redraw = true;
-            needs_screen_log = !action_is_repeat_hot_path(action);
+            needs_screen_log = !lofi_input::action_is_repeat_hot_path(action);
             state_save_pending = true;
             queue_save_pending = true;
             state_save_due = xTaskGetTickCount() + kStateSaveDebounceDelay;

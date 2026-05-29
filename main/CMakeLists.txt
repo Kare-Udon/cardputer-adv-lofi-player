@@ -21,6 +21,7 @@ idf_component_register(
         "generated_icons/settings_side_rgb565.c"
         "lofi_audio.cpp"
         "lofi_board.cpp"
+        "../src/lofi_input.cpp"
         "../src/lofi_core.cpp"
         "../src/lofi_aac_cache.cpp"
         "../src/lofi_dsp.cpp"

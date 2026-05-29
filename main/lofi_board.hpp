@@ -3,6 +3,7 @@
 #include "lofi_core.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 #include "esp_err.h"
 
@@ -24,6 +25,14 @@ struct KeyboardDiagnostics {
     esp_err_t bus_err = ESP_ERR_INVALID_STATE;
     esp_err_t probe_err = ESP_ERR_INVALID_STATE;
     const char *stage = "not-started";
+    bool input_task_started = false;
+    uint32_t queue_depth = 0;
+    uint32_t queued_events = 0;
+    uint32_t consumed_events = 0;
+    uint32_t dropped_repeats = 0;
+    uint32_t dropped_events = 0;
+    uint32_t last_event_age_ms = 0;
+    uint32_t max_event_age_ms = 0;
 };
 
 esp_err_t init_keyboard(void);
