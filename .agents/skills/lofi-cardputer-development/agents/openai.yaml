@@ -1,0 +1,7 @@
+interface:
+  display_name: "Lo-Fi Cardputer Development"
+  short_description: "Lo-Fi Cardputer firmware workflow"
+  default_prompt: "Use $lofi-cardputer-development to work on the lofi_cardputer firmware with the right validation path."
+
+policy:
+  allow_implicit_invocation: true
