@@ -3056,6 +3056,7 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
     }
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 std::vector<std::string> screen_to_lines(const ScreenModel &screen)
 {
     std::vector<std::string> lines;
@@ -3113,5 +3114,6 @@ std::string screen_auto_snapshot(const ScreenModel &screen, uint32_t revision)
         << " soft=\"" << screen.soft_left << "|" << screen.soft_center << "|" << screen.soft_right << "\"";
     return out.str();
 }
+#endif
 
 } // namespace lofi

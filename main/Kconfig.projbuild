@@ -1,0 +1,11 @@
+menu "Lo-Fi Cardputer"
+
+config LOFI_DEBUG_AUTOMATION
+    bool "Enable debug automation and self-test firmware features"
+    default n
+    help
+        Enables serial virtual controls, framebuffer dumps, machine-readable UI
+        snapshots, runtime status logs, built-in media self-tests, and sample
+        library fallback paths. Keep this disabled for release firmware.
+
+endmenu

@@ -3,15 +3,20 @@
 #include "lofi_audio.hpp"
 #include "lofi_board.hpp"
 #include "lofi_input.hpp"
-#include "lofi_selftest_mp3.hpp"
 #include "lofi_storage.hpp"
 #include "lofi_wav.hpp"
+
+#if LOFI_DEBUG_AUTOMATION_ENABLED
+#include "lofi_selftest_mp3.hpp"
+#endif
 
 #include "board_pins.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#endif
 #include "esp32s3/rom/tjpgd.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -29,16 +34,31 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 #include <fcntl.h>
+#endif
 #include <new>
 #include <strings.h>
 #include <sys/stat.h>
 #include <utility>
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 #include <unistd.h>
+#endif
 
 namespace {
 
 const char *TAG = "lofi";
+
+#if LOFI_DEBUG_AUTOMATION_ENABLED
+#define LOFI_MARK_SCREEN_LOG(value) \
+    do {                            \
+        needs_screen_log = (value); \
+    } while (0)
+#else
+#define LOFI_MARK_SCREEN_LOG(value) \
+    do {                            \
+    } while (0)
+#endif
 
 #ifndef LOFI_ACTION_TRACE_LOGS
 #define LOFI_ACTION_TRACE_LOGS 0
@@ -50,19 +70,23 @@ const char *TAG = "lofi";
 #define LOFI_ACTION_TRACE(fmt, ...) do { } while (0)
 #endif
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 const std::vector<std::string> kBootSamplePaths = {
     "/Music/Nujabes/Modal Soul/01 - Feather.mp3",
     "/Music/Nujabes/Modal Soul/02 - Ordinary Joe.flac",
     "/Music/Various Artists/Late Night/01 - Uyama Hiroto - Waltz.wav",
     "/Music/Inbox/tape memo.m4a",
 };
+#endif
 
 constexpr const char *kStateDir = "/sdcard/Music/LOFI";
 constexpr const char *kStateFile = "/sdcard/Music/LOFI/STATE.TXT";
 constexpr const char *kQueueFile = "/sdcard/Music/LOFI/QUEUE.TXT";
 constexpr const char *kIndexFile = "/sdcard/Music/LOFI/INDEX.TXT";
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 constexpr const char *kSelfTestWavFile = "/sdcard/Music/LOFI/SELFTEST.WAV";
 constexpr const char *kSelfTestMp3File = "/sdcard/Music/LOFI/SELFTEST.MP3";
+#endif
 constexpr const char *kCoverCacheDir = "/sdcard/Music/LOFI/COVERS";
 constexpr const char *kAudioCacheDir = "/sdcard/Music/LOFI/AUDIO_CACHE";
 constexpr int kCoverThumbWidth = 72;
@@ -106,12 +130,14 @@ void set_mode_overlay(lofi::ScreenModel &screen,
     screen.mode_overlay_value = active ? value : "";
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 struct MediaFormatCounts {
     size_t mp3 = 0;
     size_t wav = 0;
     size_t m4a_aac = 0;
     size_t other = 0;
 };
+#endif
 
 struct LibraryScanResult {
     lofi::LibraryIndex library;
@@ -413,6 +439,7 @@ std::vector<std::string> scan_music_paths(bool sd_mounted, bool *using_samples)
         }
     }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     if (music_paths.empty()) {
         ESP_LOGW(TAG, "No SD music found; using boot sample paths for UI self-check");
         music_paths = kBootSamplePaths;
@@ -420,6 +447,7 @@ std::vector<std::string> scan_music_paths(bool sd_mounted, bool *using_samples)
             *using_samples = true;
         }
     }
+#endif
     return music_paths;
 }
 
@@ -468,6 +496,7 @@ bool mount_sdcard(sdmmc_card_t **out_card)
     return true;
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 MediaFormatCounts count_media_formats(const lofi::LibraryIndex &library)
 {
     MediaFormatCounts counts;
@@ -494,6 +523,7 @@ void log_media_format_counts(const lofi::LibraryIndex &library)
              static_cast<unsigned>(counts.m4a_aac),
              static_cast<unsigned>(counts.other));
 }
+#endif
 
 void log_library_summary(const lofi::LibraryIndex &library)
 {
@@ -501,7 +531,9 @@ void log_library_summary(const lofi::LibraryIndex &library)
              static_cast<unsigned>(library.tracks.size()),
              static_cast<unsigned>(library.albums.size()),
              static_cast<unsigned>(library.artists.size()));
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     log_media_format_counts(library);
+#endif
 }
 
 bool file_exists(const std::string &path)
@@ -1246,6 +1278,7 @@ bool ensure_current_track_duration(lofi::LibraryIndex &library, const lofi::Play
     return ensure_track_duration(library.tracks[static_cast<size_t>(current)]);
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void write_le16(FILE *file, uint16_t value)
 {
     std::fputc(value & 0xff, file);
@@ -1382,6 +1415,7 @@ bool start_mp3_selftest(bool sd_mounted, int volume, const lofi::LofiProfile &pr
     ESP_LOGI(TAG, "MP3_SELFTEST result=%s path=%s volume=%d", esp_err_to_name(err), kSelfTestMp3File, test_volume);
     return err == ESP_OK;
 }
+#endif
 
 bool track_is_playable(const lofi::Track &track)
 {
@@ -1415,6 +1449,7 @@ bool advance_to_next_playable(const lofi::LibraryIndex &library, lofi::PlaybackS
     return false;
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void log_screen(const lofi::ScreenModel &screen)
 {
     static uint32_t revision = 0;
@@ -1425,7 +1460,9 @@ void log_screen(const lofi::ScreenModel &screen)
         ESP_LOGI(TAG, "UI %s", line.c_str());
     }
 }
+#endif
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 const char *audio_status_name(lofi_audio::Status status)
 {
     switch (status) {
@@ -1444,6 +1481,7 @@ const char *audio_status_name(lofi_audio::Status status)
     }
     return "unknown";
 }
+#endif
 
 bool lofi_profiles_equal(const lofi::LofiProfile &a, const lofi::LofiProfile &b)
 {
@@ -1461,6 +1499,7 @@ bool should_pause_active_audio(lofi_audio::Status status)
     return status == lofi_audio::Status::Playing || status == lofi_audio::Status::Paused;
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void configure_serial_debug_input()
 {
     if (!usb_serial_jtag_is_driver_installed()) {
@@ -1682,6 +1721,7 @@ void log_i2c_probe_summary()
              esp_err_to_name(imu),
              esp_err_to_name(codec));
 }
+#endif
 
 void sync_audio(lofi::LibraryIndex &library, lofi::PlaybackState &playback, lofi::UiState &ui,
                 int &active_track, bool &audio_loaded, bool &last_playing, lofi::LofiProfile &active_profile,
@@ -1760,7 +1800,9 @@ void sync_audio(lofi::LibraryIndex &library, lofi::PlaybackState &playback, lofi
             active_track = -1;
         }
         lofi_board::release_album_art_cache();
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         lofi_board::set_framebuffer_capture_enabled(false);
+#endif
         ensure_track_duration(track);
         ensure_track_album_art_cache(track, true);
         lofi::Track playback_track = track;
@@ -2140,7 +2182,9 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Cardputer Adv Lo-Fi client boot");
     ESP_LOGI(TAG, "Uses: LCD ST7789, TCA8418 keyboard, microSD, ES8311/I2S audio");
     ESP_LOGI(TAG, "Shared buses: I2C G8/G9, SD/EXT SPI G14/G39/G40");
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     configure_serial_debug_input();
+#endif
 
     esp_err_t display_err = lofi_board::init_display();
     if (display_err != ESP_OK) {
@@ -2203,10 +2247,14 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "Keyboard init failed: %s", esp_err_to_name(keyboard_err));
         ui.toast = "Keyboard unavailable";
     }
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     log_i2c_probe_summary();
+#endif
 
     lofi::ScreenModel screen = lofi::render_screen(library, playback, ui);
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     log_screen(screen);
+#endif
     if (display_err == ESP_OK) {
         lofi_board::draw_screen(screen);
     }
@@ -2222,7 +2270,9 @@ extern "C" void app_main(void)
     TickType_t last_redraw = xTaskGetTickCount();
     TickType_t last_state_save = xTaskGetTickCount();
     TickType_t state_save_due = 0;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     TickType_t last_status_log = xTaskGetTickCount();
+#endif
     TickType_t last_keyboard_retry = xTaskGetTickCount();
     TickType_t last_user_activity = xTaskGetTickCount();
     TickType_t last_audio_cache_attempt = xTaskGetTickCount();
@@ -2239,12 +2289,18 @@ extern "C" void app_main(void)
     int last_saved_position = playback.position_seconds;
     int last_sleep_timer_setting = playback.sleep_timer_seconds;
     bool sleep_timer_armed = playback.playing && playback.sleep_timer_seconds > 0;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     bool state_saved = false;
+#endif
     bool state_save_pending = false;
     bool queue_save_pending = false;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     log_runtime_status(library, playback, ui, sd_mounted, state_saved);
+#endif
     if (save_playback_state_if_possible(sd_mounted, playback)) {
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         state_saved = true;
+#endif
         ESP_LOGI(TAG, "STATE_SAVE boot ok path=%s", kStateFile);
         last_saved_position = playback.position_seconds;
     }
@@ -2255,15 +2311,19 @@ extern "C" void app_main(void)
 
     while (true) {
         bool needs_redraw = false;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         bool needs_screen_log = false;
+#endif
         bool needs_state_save = false;
         int requested_seek_seconds = -1;
         lofi::Action action = lofi::Action::None;
         const char *key_name = nullptr;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         bool frame_dump = false;
         bool boot_splash_dump = false;
         bool wav_selftest = false;
         bool mp3_selftest = false;
+#endif
         const TickType_t now_ticks = xTaskGetTickCount();
         const bool library_sync_idle = sd_mounted && !playback.playing && !audio_loaded &&
                                        now_ticks - last_user_activity >= kLibrarySyncIdleDelay;
@@ -2279,7 +2339,7 @@ extern "C" void app_main(void)
             if (library_scan_queue) {
                 ui.toast = "Syncing library";
                 needs_redraw = true;
-                needs_screen_log = true;
+                LOFI_MARK_SCREEN_LOG(true);
             }
         }
         if (library_scan_queue) {
@@ -2292,7 +2352,7 @@ extern "C" void app_main(void)
                     delete scan_result;
                     save_queue_snapshot_if_possible(sd_mounted, library, playback);
                     needs_redraw = true;
-                    needs_screen_log = true;
+                    LOFI_MARK_SCREEN_LOG(true);
                 } else if (scan_result) {
                     ESP_LOGI(TAG,
                              "LIBRARY_SYNC defer apply playing=%d audio_loaded=%d",
@@ -2308,7 +2368,7 @@ extern "C" void app_main(void)
             deferred_library_scan_result = nullptr;
             save_queue_snapshot_if_possible(sd_mounted, library, playback);
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         if (audio_cache_queue) {
             AudioCacheResult *cache_result = nullptr;
@@ -2335,12 +2395,15 @@ extern "C" void app_main(void)
             background_task_active ? static_cast<uint8_t>((xTaskGetTickCount() / pdMS_TO_TICKS(180)) % 4) : 0;
         if (background_task_active != last_background_task_active) {
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         } else if (background_task_active && background_task_frame != last_background_task_frame) {
             needs_redraw = true;
         }
-        if (lofi_board::poll_action(action, &key_name) ||
-            poll_serial_action(action, &key_name, frame_dump, boot_splash_dump, wav_selftest, mp3_selftest)) {
+        if (lofi_board::poll_action(action, &key_name)
+#if LOFI_DEBUG_AUTOMATION_ENABLED
+            || poll_serial_action(action, &key_name, frame_dump, boot_splash_dump, wav_selftest, mp3_selftest)
+#endif
+        ) {
             last_user_activity = xTaskGetTickCount();
             if (audio_cache_queue) {
                 g_audio_cache_cancel_requested = true;
@@ -2350,12 +2413,13 @@ extern "C" void app_main(void)
                 lofi_board::set_screen_awake(true);
                 ESP_LOGI(TAG, "DISPLAY_WAKE key=%s", key_name ? key_name : "?");
                 needs_redraw = true;
-                needs_screen_log = true;
+                LOFI_MARK_SCREEN_LOG(true);
             }
             LOFI_ACTION_TRACE("Key %s -> action %d", key_name ? key_name : "?", static_cast<int>(action));
             const int previous_brightness = playback.brightness_percent;
             if (wake_only) {
                 // First input after screen-off only wakes the display to avoid accidental actions.
+#if LOFI_DEBUG_AUTOMATION_ENABLED
             } else if (boot_splash_dump) {
                 lofi_board::set_framebuffer_capture_enabled(true);
                 if (display_err == ESP_OK) {
@@ -2363,7 +2427,7 @@ extern "C" void app_main(void)
                 }
                 lofi_board::dump_framebuffer_to_serial();
                 needs_redraw = true;
-                needs_screen_log = true;
+                LOFI_MARK_SCREEN_LOG(true);
             } else if (frame_dump) {
                 lofi_board::set_framebuffer_capture_enabled(true);
                 if (display_err == ESP_OK) {
@@ -2398,6 +2462,7 @@ extern "C" void app_main(void)
                 } else {
                     ui.toast = wav_selftest ? "WAV self-test failed" : "MP3 self-test failed";
                 }
+#endif
             } else if (ui.page == lofi::Page::Scan && (action == lofi::Action::Ok ||
                                                        action == lofi::Action::PlayPause)) {
                 lofi_audio::stop();
@@ -2430,7 +2495,7 @@ extern "C" void app_main(void)
                 lofi_board::set_screen_brightness_percent(playback.brightness_percent);
             }
             needs_redraw = true;
-            needs_screen_log = !lofi_input::action_is_repeat_hot_path(action);
+            LOFI_MARK_SCREEN_LOG(!lofi_input::action_is_repeat_hot_path(action));
             state_save_pending = true;
             queue_save_pending = true;
             state_save_due = xTaskGetTickCount() + kStateSaveDebounceDelay;
@@ -2442,15 +2507,15 @@ extern "C" void app_main(void)
         sync_audio(library, playback, ui, active_track, audio_loaded, last_playing, active_profile, requested_seek_seconds);
         if (previous_playing != playback.playing || previous_toast != ui.toast) {
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         if (ensure_current_track_duration(library, playback)) {
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         if (ensure_current_album_art_cache(library, playback)) {
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         const bool sleep_timer_setting_changed = playback.sleep_timer_seconds != last_sleep_timer_setting;
         if (sleep_timer_setting_changed) {
@@ -2475,7 +2540,7 @@ extern "C" void app_main(void)
                 ui.toast = "Sleep timer done";
                 ESP_LOGI(TAG, "SLEEP_TIMER pause timeout=%d", playback.sleep_timer_seconds);
                 needs_redraw = true;
-                needs_screen_log = true;
+                LOFI_MARK_SCREEN_LOG(true);
                 state_save_pending = true;
                 queue_save_pending = true;
                 state_save_due = xTaskGetTickCount();
@@ -2489,7 +2554,7 @@ extern "C" void app_main(void)
                                                                                 : pdMS_TO_TICKS(750));
         if (previous_position != playback.position_seconds) {
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         } else if (animating_screen && xTaskGetTickCount() - last_redraw > redraw_interval) {
             needs_redraw = true;
         }
@@ -2497,12 +2562,12 @@ extern "C" void app_main(void)
             xTaskGetTickCount() >= volume_overlay_until) {
             volume_overlay_until = 0;
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         if (mode_overlay_until != 0 && xTaskGetTickCount() >= mode_overlay_until) {
             mode_overlay_until = 0;
             needs_redraw = true;
-            needs_screen_log = true;
+            LOFI_MARK_SCREEN_LOG(true);
         }
         if (playback.position_seconds != last_saved_position &&
             xTaskGetTickCount() - last_state_save > (playback.playing ? pdMS_TO_TICKS(30000) : pdMS_TO_TICKS(5000))) {
@@ -2515,7 +2580,7 @@ extern "C" void app_main(void)
             if (keyboard_err == ESP_OK && ui.toast == "Keyboard unavailable") {
                 ui.toast = "Keyboard ready";
                 needs_redraw = true;
-                needs_screen_log = true;
+                LOFI_MARK_SCREEN_LOG(true);
             }
             last_keyboard_retry = xTaskGetTickCount();
         }
@@ -2533,9 +2598,11 @@ extern "C" void app_main(void)
                              mode_overlay_kind,
                              mode_overlay_title,
                              mode_overlay_value);
+#if LOFI_DEBUG_AUTOMATION_ENABLED
             if (needs_screen_log) {
                 log_screen(screen);
             }
+#endif
             if (display_err == ESP_OK) {
                 lofi_board::draw_screen(screen);
             }
@@ -2548,7 +2615,9 @@ extern "C" void app_main(void)
         }
         if (needs_state_save) {
             if (save_playback_state_if_possible(sd_mounted, playback)) {
+#if LOFI_DEBUG_AUTOMATION_ENABLED
                 state_saved = true;
+#endif
                 last_state_save = xTaskGetTickCount();
                 last_saved_position = playback.position_seconds;
                 state_save_pending = false;
@@ -2564,10 +2633,12 @@ extern "C" void app_main(void)
                 state_save_due = xTaskGetTickCount() + kStateSaveRetryDelay;
             }
         }
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         if (xTaskGetTickCount() - last_status_log > pdMS_TO_TICKS(5000)) {
             log_runtime_status(library, playback, ui, sd_mounted, state_saved);
             last_status_log = xTaskGetTickCount();
         }
+#endif
         if (display_err == ESP_OK && lofi_board::screen_awake() && playback.screen_off_seconds > 0 &&
             xTaskGetTickCount() - last_user_activity >= pdMS_TO_TICKS(playback.screen_off_seconds * 1000)) {
             lofi_board::set_screen_awake(false);

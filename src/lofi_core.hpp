@@ -1,5 +1,8 @@
 #pragma once
 
+#include "lofi_build_config.hpp"
+
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -263,8 +266,10 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
 ScreenModel render_boot_splash_screen(void);
 void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &ui, Action action);
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 std::vector<std::string> screen_to_lines(const ScreenModel &screen);
 uint32_t screen_hash(const ScreenModel &screen);
 std::string screen_auto_snapshot(const ScreenModel &screen, uint32_t revision);
+#endif
 
 } // namespace lofi

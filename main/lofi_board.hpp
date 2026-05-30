@@ -15,9 +15,11 @@ void set_screen_brightness_percent(int percent);
 void set_screen_awake(bool awake);
 bool screen_awake(void);
 void tick_display(void);
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void dump_framebuffer_to_serial(void);
-void release_album_art_cache(void);
 void set_framebuffer_capture_enabled(bool enabled);
+#endif
+void release_album_art_cache(void);
 
 struct KeyboardDiagnostics {
     bool ready = false;
@@ -37,7 +39,9 @@ struct KeyboardDiagnostics {
 
 esp_err_t init_keyboard(void);
 bool poll_action(lofi::Action &action, const char **key_name);
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 KeyboardDiagnostics keyboard_diagnostics(void);
+#endif
 esp_err_t probe_i2c_device(uint8_t addr);
 esp_err_t read_i2c_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t len);
 esp_err_t write_i2c_reg(uint8_t addr, uint8_t reg, uint8_t value);

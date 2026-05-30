@@ -96,9 +96,11 @@ uint32_t s_keyboard_dropped_repeats = 0;
 uint32_t s_keyboard_dropped_events = 0;
 uint32_t s_keyboard_last_event_age_ms = 0;
 uint32_t s_keyboard_max_event_age_ms = 0;
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 uint16_t *s_shadow_framebuffer = nullptr;
 bool s_shadow_framebuffer_valid = false;
 uint32_t s_framebuffer_dump_seq = 0;
+#endif
 lv_display_t *s_lvgl_display = nullptr;
 esp_timer_handle_t s_lvgl_tick_timer = nullptr;
 alignas(4) uint16_t s_lvgl_draw_buffer[LCD_WIDTH * 36] = {};
@@ -211,13 +213,17 @@ esp_err_t lcd_draw_solid(uint16_t color)
     }
     for (int y = 0; y < LCD_HEIGHT; ++y) {
         ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, y, LCD_WIDTH, y + 1, line), TAG, "draw line");
+#if LOFI_DEBUG_AUTOMATION_ENABLED
         if (s_shadow_framebuffer) {
             std::fill_n(&s_shadow_framebuffer[y * LCD_WIDTH], LCD_WIDTH, color);
         }
+#endif
     }
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     if (s_shadow_framebuffer) {
         s_shadow_framebuffer_valid = true;
     }
+#endif
     return ESP_OK;
 }
 
@@ -261,6 +267,7 @@ void unlock_i2c(void)
     }
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 uint32_t framebuffer_hash(void)
 {
     uint32_t hash = 2166136261u;
@@ -276,6 +283,7 @@ uint32_t framebuffer_hash(void)
     }
     return hash;
 }
+#endif
 
 std::string strip_selection_marker(const std::string &value)
 {
@@ -1055,6 +1063,7 @@ void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map
         lv_display_flush_ready(display);
     }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
     if (s_shadow_framebuffer) {
         for (int32_t row = 0; row < height; ++row) {
             const int32_t dst_y = area->y1 + row;
@@ -1070,6 +1079,7 @@ void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map
         }
         s_shadow_framebuffer_valid = true;
     }
+#endif
 }
 
 esp_err_t init_lvgl_display(void)
@@ -3097,6 +3107,7 @@ void release_album_art_cache(void)
     s_album_art_valid = false;
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void set_framebuffer_capture_enabled(bool enabled)
 {
     if (!enabled) {
@@ -3116,6 +3127,7 @@ void set_framebuffer_capture_enabled(bool enabled)
         s_shadow_framebuffer_valid = false;
     }
 }
+#endif
 
 esp_err_t init_display(void)
 {
@@ -3265,6 +3277,7 @@ void tick_display(void)
     }
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 void dump_framebuffer_to_serial(void)
 {
     if (!s_shadow_framebuffer || !s_shadow_framebuffer_valid) {
@@ -3305,6 +3318,7 @@ void dump_framebuffer_to_serial(void)
                 static_cast<unsigned long>(hash));
     std::fflush(stdout);
 }
+#endif
 
 esp_err_t init_keyboard(void)
 {
@@ -3424,6 +3438,7 @@ bool poll_action(lofi::Action &action, const char **key_name)
     return true;
 }
 
+#if LOFI_DEBUG_AUTOMATION_ENABLED
 KeyboardDiagnostics keyboard_diagnostics(void)
 {
     s_keyboard_diag.ready = s_keyboard_ready;
@@ -3438,6 +3453,7 @@ KeyboardDiagnostics keyboard_diagnostics(void)
     s_keyboard_diag.max_event_age_ms = s_keyboard_max_event_age_ms;
     return s_keyboard_diag;
 }
+#endif
 
 esp_err_t probe_i2c_device(uint8_t addr)
 {

@@ -1,3 +1,21 @@
+set(lofi_requires
+    esp_driver_gpio
+    esp_driver_i2c
+    esp_driver_i2s
+    esp_driver_spi
+    esp_lcd
+    esp_timer
+    espressif__esp_audio_codec
+    fatfs
+    lvgl
+    nvs_flash
+    sdmmc
+)
+
+if(CONFIG_LOFI_DEBUG_AUTOMATION)
+    list(APPEND lofi_requires esp_driver_usb_serial_jtag)
+endif()
+
 idf_component_register(
     SRCS
         "app_main.cpp"
@@ -31,16 +49,5 @@ idf_component_register(
         "."
         "../src"
     REQUIRES
-        esp_driver_gpio
-        esp_driver_i2c
-        esp_driver_i2s
-        esp_driver_spi
-        esp_driver_usb_serial_jtag
-        esp_lcd
-        esp_timer
-        espressif__esp_audio_codec
-        fatfs
-        lvgl
-        nvs_flash
-        sdmmc
+        ${lofi_requires}
 )
