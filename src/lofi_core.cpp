@@ -2497,6 +2497,9 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
             ui.selected = ui.selected == 0 ? 4 : ui.selected - 1;
         } else if (action == Action::Down || action == Action::Right) {
             ui.selected = (ui.selected + 1) % 5;
+        } else if (action == Action::Back) {
+            ui.selected = 4;
+            ui.scroll = 0;
         } else if (action == Action::Menu) {
             navigate_to(ui, Page::PlaybackMenu);
         } else if (action == Action::Ok) {
