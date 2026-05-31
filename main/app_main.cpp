@@ -1896,7 +1896,7 @@ void rebuild_library(bool sd_mounted, lofi::LibraryIndex &library, lofi::Playbac
         }
     }
 
-    ui.selected = 0;
+    ui.selected = lofi::kLibraryHomeNowPlayingIndex;
     ui.scroll = 0;
     ui.back_stack.clear();
     ui.page = library.tracks.empty() ? lofi::Page::Empty : lofi::Page::LibraryHome;
@@ -2238,6 +2238,9 @@ extern "C" void app_main(void)
 
     load_playback_state_if_possible(sd_mounted, library, playback, ui);
     load_queue_snapshot_if_possible(sd_mounted, library, playback, ui);
+    if (ui.page == lofi::Page::LibraryHome) {
+        ui.selected = lofi::kLibraryHomeNowPlayingIndex;
+    }
     if (display_err == ESP_OK) {
         lofi_board::set_screen_brightness_percent(playback.brightness_percent);
     }

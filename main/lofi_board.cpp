@@ -2692,7 +2692,7 @@ esp_err_t draw_screen_lvgl_now_playing(const lofi::ScreenModel &screen)
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_lvgl_now_header(root, "RECORDED", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
+    draw_lvgl_now_header(root, "NOW", chrome, accent, ink, dim, line, accent, screen.background_task_active, screen.background_task_frame);
     draw_lvgl_album_art(root, panel, bg, accent, teal, dim, line, screen.album_art_cache_path);
 
     const std::string title = !screen.rows.empty() ? screen.rows[0].left : "No track selected";

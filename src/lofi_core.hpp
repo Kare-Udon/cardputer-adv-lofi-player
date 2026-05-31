@@ -9,6 +9,9 @@
 
 namespace lofi {
 
+constexpr size_t kLibraryHomeItemCount = 5;
+constexpr size_t kLibraryHomeNowPlayingIndex = 4;
+
 enum class RepeatMode {
     Off,
     One,

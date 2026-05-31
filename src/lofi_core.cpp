@@ -863,7 +863,7 @@ void reset_to_home(UiState &ui)
     ui.action_return_page = Page::LibraryRoot;
     ui.context_index = 0;
     ui.parent_index = 0;
-    ui.selected = 0;
+    ui.selected = kLibraryHomeNowPlayingIndex;
     ui.scroll = 0;
     ui.selected_tracks.clear();
     ui.action_tracks.clear();
@@ -1956,7 +1956,7 @@ ScreenModel render_screen(const LibraryIndex &index, const PlaybackState &playba
         screen.soft_center = "Open";
         screen.soft_right = "Menu";
         static const char *items[] = {"Library", "Queue", "Lo-Fi", "Settings", "Now Playing"};
-        const size_t selected = ui.selected < 5 ? ui.selected : 0;
+        const size_t selected = ui.selected < kLibraryHomeItemCount ? ui.selected : kLibraryHomeNowPlayingIndex;
         for (size_t i = 0; i < kLibraryRootVisibleRows; ++i) {
             std::string right;
             if (i == 0) {
@@ -2490,15 +2490,15 @@ void apply_action(const LibraryIndex &index, PlaybackState &playback, UiState &u
 
     switch (ui.page) {
     case Page::LibraryHome:
-        if (ui.selected >= 5) {
-            ui.selected = 0;
+        if (ui.selected >= kLibraryHomeItemCount) {
+            ui.selected = kLibraryHomeNowPlayingIndex;
         }
         if (action == Action::Up || action == Action::Left) {
-            ui.selected = ui.selected == 0 ? 4 : ui.selected - 1;
+            ui.selected = ui.selected == 0 ? kLibraryHomeItemCount - 1 : ui.selected - 1;
         } else if (action == Action::Down || action == Action::Right) {
-            ui.selected = (ui.selected + 1) % 5;
+            ui.selected = (ui.selected + 1) % kLibraryHomeItemCount;
         } else if (action == Action::Back) {
-            ui.selected = 4;
+            ui.selected = kLibraryHomeNowPlayingIndex;
             ui.scroll = 0;
         } else if (action == Action::Menu) {
             navigate_to(ui, Page::PlaybackMenu);
