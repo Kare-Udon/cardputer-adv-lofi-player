@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Existing GitHub Release tag to upload assets to.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +16,8 @@ permissions:
 env:
   IDF_TARGET: esp32s3
   FIRMWARE_NAME: lofi_cardputer
+  IDF_CCACHE_ENABLE: "1"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
@@ -27,6 +34,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ env.IDF_TARGET }}-ccache-${{ hashFiles('dependencies.lock', 'sdkconfig.defaults', 'sdkconfig.release.defaults', 'CMakeLists.txt', 'main/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.IDF_TARGET }}-ccache-
+
       - name: Build firmware
         shell: bash
         run: |
@@ -34,14 +49,16 @@ jobs:
             source "$IDF_PATH/export.sh"
           fi
 
+          ccache --zero-stats || true
           idf.py set-target "$IDF_TARGET"
           idf.py build
+          ccache --show-stats || true
 
       - name: Package firmware
         id: package
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs['release-tag'] || github.ref_name }}
         run: |
           set -euo pipefail
 
@@ -75,7 +92,7 @@ jobs:
   upload-release-asset:
     name: Upload firmware to GitHub Release
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || github.event.inputs['release-tag'] != ''
     runs-on: ubuntu-latest
 
     steps:
@@ -89,6 +106,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs['release-tag'] }}
         run: |
-          gh release upload "$RELEASE_TAG" dist/release-assets/* --clobber
+          gh release upload "$RELEASE_TAG" dist/release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
