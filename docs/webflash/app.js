@@ -1,5 +1,7 @@
 const ASSET_MANIFEST = "webflash-manifest.json";
+const WEBFLASH_BIN = "lofi_cardputer-webflash.bin";
 const ASSET_ZIP_SUFFIX = ".zip";
+const PAGES_RELEASE_BASE = "releases";
 const REPOSITORY_OWNER = "Kare-Udon";
 const REPOSITORY_NAME = "cardputer-adv-lofi-player";
 
@@ -46,9 +48,21 @@ function zipAsset(release) {
   return release.assets.find((asset) => asset.name.endsWith(ASSET_ZIP_SUFFIX));
 }
 
+function pagesReleasePath(tag) {
+  return tag.replaceAll("/", "-");
+}
+
+function pagesAssetUrl(tag, name) {
+  return new URL(
+    `${PAGES_RELEASE_BASE}/${pagesReleasePath(tag)}/${name}`,
+    window.location.href,
+  ).href;
+}
+
 function toViewModel(release) {
   const manifest = assetByName(release, ASSET_MANIFEST);
-  if (!manifest) {
+  const webflashBin = assetByName(release, WEBFLASH_BIN);
+  if (!manifest || !webflashBin) {
     return null;
   }
   return {
@@ -57,7 +71,7 @@ function toViewModel(release) {
     publishedAt: release.published_at,
     htmlUrl: release.html_url,
     commit: release.target_commitish || "",
-    manifestUrl: manifest.browser_download_url,
+    manifestUrl: pagesAssetUrl(release.tag_name, ASSET_MANIFEST),
     zipUrl: zipAsset(release)?.browser_download_url || "",
   };
 }

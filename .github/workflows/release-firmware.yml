@@ -66,6 +66,8 @@ jobs:
             source "$IDF_PATH/export.sh"
           fi
 
+          package_version="${RELEASE_TAG//\//-}"
+
           python scripts/package_webflash.py \
             --build-dir build \
             --dist-dir dist \
@@ -73,9 +75,9 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --commit "$GITHUB_SHA" \
+            --asset-base-url "." \
             --merge-mode esptool
 
-          package_version="${RELEASE_TAG//\//-}"
           package_name="${FIRMWARE_NAME}-${package_version}.zip"
 
           echo "artifact-name=${FIRMWARE_NAME}-firmware" >> "$GITHUB_OUTPUT"
@@ -96,6 +98,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout Pages source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
       - name: Download firmware package
         uses: actions/download-artifact@v4
         with:
@@ -109,3 +116,27 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs['release-tag'] }}
         run: |
           gh release upload "$RELEASE_TAG" dist/release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish WebFlash assets to Pages source
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs['release-tag'] }}
+        run: |
+          set -euo pipefail
+
+          release_path="${RELEASE_TAG//\//-}"
+          target="docs/webflash/releases/${release_path}"
+          mkdir -p "$target"
+          cp dist/release-assets/webflash-manifest.json "$target/"
+          cp dist/release-assets/lofi_cardputer-webflash.bin "$target/"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$target/webflash-manifest.json" "$target/lofi_cardputer-webflash.bin"
+
+          if git diff --cached --quiet; then
+            echo "WebFlash Pages assets are already up to date."
+          else
+            git commit -m "Add WebFlash assets for ${RELEASE_TAG}"
+            git push origin HEAD:main
+          fi

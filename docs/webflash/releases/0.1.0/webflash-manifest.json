@@ -1,0 +1,16 @@
+{
+  "name": "Cardputer Adv Lo-Fi Player",
+  "version": "0.1.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "./lofi_cardputer-webflash.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
