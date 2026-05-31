@@ -1,0 +1,13 @@
+{
+  "releases": [
+    {
+      "tag": "0.1.0",
+      "prerelease": false,
+      "publishedAt": "2026-05-31T03:55:17Z",
+      "htmlUrl": "https://github.com/Kare-Udon/cardputer-adv-lofi-player/releases/tag/0.1.0",
+      "commit": "main",
+      "manifestUrl": "releases/0.1.0/webflash-manifest.json",
+      "zipUrl": "https://github.com/Kare-Udon/cardputer-adv-lofi-player/releases/download/0.1.0/lofi_cardputer-0.1.0.zip"
+    }
+  ]
+}

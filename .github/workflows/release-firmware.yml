@@ -120,6 +120,7 @@ jobs:
       - name: Publish WebFlash assets to Pages source
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs['release-tag'] }}
         run: |
           set -euo pipefail
@@ -129,10 +130,61 @@ jobs:
           mkdir -p "$target"
           cp dist/release-assets/webflash-manifest.json "$target/"
           cp dist/release-assets/lofi_cardputer-webflash.bin "$target/"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$RUNNER_TEMP/webflash-release.json"
+
+          RELEASE_JSON="$RUNNER_TEMP/webflash-release.json" \
+          PACKAGE_NAME="${{ needs.build.outputs.package-name }}" \
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          release = json.loads(Path(os.environ["RELEASE_JSON"]).read_text(encoding="utf-8"))
+          package_name = os.environ["PACKAGE_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = release["tag_name"]
+          release_path = tag.replace("/", "-")
+          index_path = Path("docs/webflash/releases/index.json")
+
+          releases = []
+          if index_path.exists():
+              payload = json.loads(index_path.read_text(encoding="utf-8"))
+              releases = payload.get("releases", [])
+
+          zip_url = ""
+          for asset in release.get("assets", []):
+              if asset.get("name") == package_name:
+                  zip_url = asset.get("browser_download_url", "")
+                  break
+          if not zip_url:
+              zip_url = (
+                  f"https://github.com/{repo}/releases/download/"
+                  f"{quote(tag, safe='')}/{quote(package_name, safe='')}"
+              )
+
+          entry = {
+              "tag": tag,
+              "prerelease": bool(release.get("prerelease")),
+              "publishedAt": release.get("published_at") or "",
+              "htmlUrl": release.get("html_url") or f"https://github.com/{repo}/releases/tag/{quote(tag, safe='')}",
+              "commit": release.get("target_commitish") or "",
+              "manifestUrl": f"releases/{release_path}/webflash-manifest.json",
+              "zipUrl": zip_url,
+          }
+
+          releases = [item for item in releases if item.get("tag") != tag]
+          releases.append(entry)
+          releases.sort(key=lambda item: item.get("publishedAt") or "", reverse=True)
+          index_path.write_text(
+              json.dumps({"releases": releases}, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$target/webflash-manifest.json" "$target/lofi_cardputer-webflash.bin"
+          git add "$target/webflash-manifest.json" "$target/lofi_cardputer-webflash.bin" docs/webflash/releases/index.json
 
           if git diff --cached --quiet; then
             echo "WebFlash Pages assets are already up to date."
