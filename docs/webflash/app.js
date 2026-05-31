@@ -1,7 +1,4 @@
-const ASSET_MANIFEST = "webflash-manifest.json";
-const WEBFLASH_BIN = "lofi_cardputer-webflash.bin";
-const ASSET_ZIP_SUFFIX = ".zip";
-const PAGES_RELEASE_BASE = "releases";
+const RELEASE_INDEX = "releases/index.json";
 const REPOSITORY_OWNER = "Kare-Udon";
 const REPOSITORY_NAME = "cardputer-adv-lofi-player";
 
@@ -40,39 +37,25 @@ function setLink(link, href) {
   link.setAttribute("aria-disabled", "false");
 }
 
-function assetByName(release, name) {
-  return release.assets.find((asset) => asset.name === name);
-}
-
-function zipAsset(release) {
-  return release.assets.find((asset) => asset.name.endsWith(ASSET_ZIP_SUFFIX));
-}
-
-function pagesReleasePath(tag) {
-  return tag.replaceAll("/", "-");
-}
-
-function pagesAssetUrl(tag, name) {
-  return new URL(
-    `${PAGES_RELEASE_BASE}/${pagesReleasePath(tag)}/${name}`,
-    window.location.href,
-  ).href;
+function absoluteUrl(value) {
+  if (!value) {
+    return "";
+  }
+  return new URL(value, window.location.href).href;
 }
 
 function toViewModel(release) {
-  const manifest = assetByName(release, ASSET_MANIFEST);
-  const webflashBin = assetByName(release, WEBFLASH_BIN);
-  if (!manifest || !webflashBin) {
+  if (!release.tag || !release.manifestUrl) {
     return null;
   }
   return {
-    tag: release.tag_name,
-    prerelease: release.prerelease,
-    publishedAt: release.published_at,
-    htmlUrl: release.html_url,
-    commit: release.target_commitish || "",
-    manifestUrl: pagesAssetUrl(release.tag_name, ASSET_MANIFEST),
-    zipUrl: zipAsset(release)?.browser_download_url || "",
+    tag: release.tag,
+    prerelease: Boolean(release.prerelease),
+    publishedAt: release.publishedAt || "",
+    htmlUrl: absoluteUrl(release.htmlUrl),
+    commit: release.commit || "",
+    manifestUrl: absoluteUrl(release.manifestUrl),
+    zipUrl: absoluteUrl(release.zipUrl),
   };
 }
 
@@ -134,30 +117,30 @@ function renderSelectedRelease() {
 }
 
 async function loadReleases() {
-  setStatus("Checking GitHub Releases automatically...");
+  setStatus("Checking WebFlash releases automatically...");
   elements.refreshButton.disabled = true;
   elements.versionSelect.disabled = true;
   elements.installerPanel.hidden = true;
 
   try {
-    const url = `https://api.github.com/repos/${REPOSITORY_OWNER}/${REPOSITORY_NAME}/releases?per_page=30`;
-    const response = await fetch(url, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
+    const response = await fetch(RELEASE_INDEX, { cache: "no-store" });
     if (!response.ok) {
-      throw new Error(`GitHub Releases API returned ${response.status}`);
+      throw new Error(`Release index returned ${response.status}`);
     }
 
     const payload = await response.json();
+    if (!Array.isArray(payload.releases)) {
+      throw new Error("Release index is invalid.");
+    }
     const releases = sortReleases(
-      payload.filter((release) => !release.draft).map(toViewModel).filter(Boolean),
+      payload.releases.map(toViewModel).filter(Boolean),
     );
     state.releases = releases;
     renderVersionOptions();
 
     const selected = chooseDefaultRelease(releases);
     if (!selected) {
-      setStatus("No GitHub Release with webflash-manifest.json was found.", true);
+      setStatus("No WebFlash release was found.", true);
       renderSelectedRelease();
       return;
     }
@@ -172,7 +155,7 @@ async function loadReleases() {
 
 elements.refreshButton.addEventListener("click", () => {
   loadReleases().catch((error) => {
-    setStatus(error.message || "Failed to read GitHub Releases.", true);
+    setStatus(error.message || "Failed to read WebFlash releases.", true);
     state.releases = [];
     renderVersionOptions();
     renderSelectedRelease();
@@ -186,4 +169,4 @@ elements.versionSelect.addEventListener("change", () => {
 });
 
 elements.repoName.textContent = `${REPOSITORY_OWNER}/${REPOSITORY_NAME}`;
-loadReleases().catch((error) => setStatus(error.message || "Failed to read GitHub Releases.", true));
+loadReleases().catch((error) => setStatus(error.message || "Failed to read WebFlash releases.", true));
