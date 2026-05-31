@@ -6,11 +6,13 @@ Cardputer Adv Lo-Fi Player is a local music player firmware for M5Stack Cardpute
 
 ![Cardputer Adv Lo-Fi Player demo](assets/readme/cardputer-adv-lofi-demo.gif)
 
-## Status
+## Install
 
-Current version: `v0.1.0` beta.
+Open the WebFlash tool:
 
-Release flashing packages will be added later.
+[Cardputer Adv Lo-Fi Player WebFlash](https://kare-udon.github.io/cardputer-adv-lofi-player/webflash/)
+
+Click the tool on that page, then follow the prompts to flash the firmware.
 
 ## Features
 
@@ -45,12 +47,6 @@ The firmware stores its index and playback state here:
 ```
 
 Delete these two files if you want to rescan music or reset playback state.
-
-## Install
-
-Release flashing packages are not available yet. For now, build and flash from source.
-
-After a release is available, prefer the instructions on the release page.
 
 ## Build From Source
 

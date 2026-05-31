@@ -6,11 +6,13 @@ Cardputer Adv Lo-Fi Player 是给 M5Stack Cardputer Adv 用的本地音乐播放
 
 ![Cardputer Adv Lo-Fi Player demo](assets/readme/cardputer-adv-lofi-demo.gif)
 
-## 当前状态
+## 安装
 
-当前版本：`v0.1.0` beta。
+打开 WebFlash 工具：
 
-release 刷机包稍后补上。
+[Cardputer Adv Lo-Fi Player WebFlash](https://kare-udon.github.io/cardputer-adv-lofi-player/webflash/)
+
+点击页面里的工具，然后按照提示刷写固件。
 
 ## 功能
 
@@ -45,12 +47,6 @@ release 刷机包稍后补上。
 ```
 
 如果想重新扫描音乐或重置播放状态，可以删除这两个文件。
-
-## 安装
-
-release 刷机包暂未提供。当前请从源码构建并刷写。
-
-有正式 release 后，优先按照 release 页面里的说明安装。
 
 ## 从源码构建
 
