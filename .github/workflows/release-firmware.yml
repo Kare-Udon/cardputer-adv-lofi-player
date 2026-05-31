@@ -1,0 +1,94 @@
+name: Release Firmware
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  IDF_TARGET: esp32s3
+  FIRMWARE_NAME: lofi_cardputer
+
+jobs:
+  build:
+    name: Build ESP-IDF firmware
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.4
+
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+      package-name: ${{ steps.package.outputs.package-name }}
+      release-asset-dir: ${{ steps.package.outputs.release-asset-dir }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          if [ -n "${IDF_PATH:-}" ] && [ -f "$IDF_PATH/export.sh" ]; then
+            source "$IDF_PATH/export.sh"
+          fi
+
+          idf.py set-target "$IDF_TARGET"
+          idf.py build
+
+      - name: Package firmware
+        id: package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${IDF_PATH:-}" ] && [ -f "$IDF_PATH/export.sh" ]; then
+            source "$IDF_PATH/export.sh"
+          fi
+
+          python scripts/package_webflash.py \
+            --build-dir build \
+            --dist-dir dist \
+            --firmware-name "$FIRMWARE_NAME" \
+            --release-tag "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --merge-mode esptool
+
+          package_version="${RELEASE_TAG//\//-}"
+          package_name="${FIRMWARE_NAME}-${package_version}.zip"
+
+          echo "artifact-name=${FIRMWARE_NAME}-firmware" >> "$GITHUB_OUTPUT"
+          echo "package-name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "release-asset-dir=dist/release-assets" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: ${{ steps.package.outputs.release-asset-dir }}/*
+          if-no-files-found: error
+
+  upload-release-asset:
+    name: Upload firmware to GitHub Release
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download firmware package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: dist/release-assets
+
+      - name: Attach package to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" dist/release-assets/* --clobber

@@ -1,0 +1,228 @@
+:root {
+  color-scheme: light;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  background: #f5f3ef;
+  color: #1f2423;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+}
+
+.shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 32px 18px;
+}
+
+.panel {
+  width: min(760px, 100%);
+  border: 1px solid #d8d2c8;
+  border-radius: 8px;
+  background: #fffdfa;
+  padding: 28px;
+  box-shadow: 0 16px 48px rgb(31 36 35 / 12%);
+}
+
+.title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: #5f6f66;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(28px, 5vw, 42px);
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.notice {
+  margin: 24px 0;
+  border-left: 4px solid #c18418;
+  background: #fff5df;
+  padding: 12px 14px;
+  color: #5b4214;
+  line-height: 1.55;
+}
+
+.repo-box {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #e3ddd3;
+  border-radius: 8px;
+  background: #fbf8f2;
+  padding: 14px;
+}
+
+.repo-label {
+  margin: 0 0 4px;
+  color: #65726c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.repo-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  font-weight: 800;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: #55615d;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+input,
+select,
+button {
+  min-height: 42px;
+  border: 1px solid #cfc8bd;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2423;
+  font: inherit;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 0 12px;
+}
+
+button {
+  cursor: pointer;
+  padding: 0 16px;
+  background: #21433a;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+button:hover {
+  background: #18352e;
+}
+
+.version-row {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.release-meta {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin: 18px 0 0;
+}
+
+.release-meta div {
+  border: 1px solid #e3ddd3;
+  border-radius: 6px;
+  padding: 12px;
+  background: #fbf8f2;
+}
+
+dt {
+  color: #65726c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+dd {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.installer {
+  margin-top: 22px;
+  border: 1px solid #b9cec5;
+  border-radius: 8px;
+  background: #edf7f2;
+  padding: 18px;
+}
+
+esp-web-install-button {
+  --esp-tools-button-color: #21433a;
+  --esp-tools-button-text-color: #ffffff;
+}
+
+.install-cta {
+  width: 100%;
+  min-height: 48px;
+}
+
+.status {
+  min-height: 22px;
+  margin: 18px 0 0;
+  color: #55615d;
+  line-height: 1.45;
+}
+
+.status.error {
+  color: #9a3412;
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.links a {
+  border: 1px solid #cfc8bd;
+  border-radius: 999px;
+  padding: 8px 12px;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.links a[aria-disabled="true"] {
+  pointer-events: none;
+  opacity: 0.45;
+}
+
+@media (max-width: 680px) {
+  .panel {
+    padding: 22px;
+  }
+
+  .title-row,
+  .repo-box,
+  .release-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .title-row {
+    display: grid;
+  }
+}

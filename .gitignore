@@ -7,10 +7,16 @@ build-*/
 managed_components/
 
 # Local planning, documentation, debug, and verification materials
-README.md
 docs/
+!docs/
+docs/*
+!docs/webflash/
+!docs/webflash/**
 lofi_cardputer_plan/
 scripts/
+!scripts/
+scripts/*
+!scripts/package_webflash.py
 tests/
 tools/
 

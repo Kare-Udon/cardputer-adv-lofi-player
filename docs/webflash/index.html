@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cardputer Adv Lo-Fi Player WebFlash</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+    ></script>
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="title-row">
+          <div>
+            <p class="eyebrow">M5Stack Cardputer Adv</p>
+            <h1>Lo-Fi Player WebFlash</h1>
+          </div>
+        </div>
+
+        <div class="notice">
+          For M5Stack Cardputer Adv only. Connect with a USB data cable and use Chrome or Edge.
+        </div>
+
+        <div class="repo-box">
+          <div>
+            <p class="repo-label">Firmware source</p>
+            <p class="repo-name" id="repo-name">Kare-Udon/cardputer-adv-lofi-player</p>
+          </div>
+          <button type="button" id="refresh-button">Check Again</button>
+        </div>
+
+        <div class="version-row">
+          <label for="version-select">Firmware Version</label>
+          <select id="version-select" disabled>
+            <option>Loading</option>
+          </select>
+        </div>
+
+        <dl class="release-meta">
+          <div>
+            <dt>Channel</dt>
+            <dd id="channel-value">-</dd>
+          </div>
+          <div>
+            <dt>Published</dt>
+            <dd id="published-value">-</dd>
+          </div>
+          <div>
+            <dt>Commit</dt>
+            <dd id="commit-value">-</dd>
+          </div>
+        </dl>
+
+        <div class="installer" id="installer-panel" hidden>
+          <esp-web-install-button id="install-button">
+            <button slot="activate" class="install-cta">Connect Device And Flash</button>
+            <span slot="unsupported">This browser does not support Web Serial. Use Chrome or Edge.</span>
+            <span slot="not-allowed">Open this page over HTTPS or localhost.</span>
+          </esp-web-install-button>
+        </div>
+
+        <p class="status" id="status">Preparing...</p>
+
+        <div class="links">
+          <a id="release-link" href="#" target="_blank" rel="noreferrer" aria-disabled="true">
+            Release Page
+          </a>
+          <a id="zip-link" href="#" target="_blank" rel="noreferrer" aria-disabled="true">
+            Manual Flash Package
+          </a>
+          <a id="manifest-link" href="#" target="_blank" rel="noreferrer" aria-disabled="true">
+            WebFlash manifest
+          </a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
